@@ -2,11 +2,17 @@ version: 2.1
 
 # Run the fork's OWN GitHub Actions workflows against the PR commit via nektos/act,
 # on CircleCI compute (Actions stays disabled on this repo). One CircleCI job per
-# PR-triggered reth workflow, run in parallel; each executes the PR's real workflow file.
+# PR-triggered reth workflow, in parallel; each runs the PR's real workflow file.
 #
-# sccache is disabled at the act layer (remap mozilla-actions/sccache-action -> no-op +
-# unset RUSTC_WRAPPER). It's only a compiler cache, not a check; disabling it avoids
-# needing a GITHUB_TOKEN (which we must not expose to act-executed untrusted PR code).
+# Tokenless by design (no GITHUB_TOKEN handed to act-executed untrusted PR code):
+#  - sccache disabled (remap sccache-action -> no-op + unset RUSTC_WRAPPER); it's a
+#    compiler cache, not a check.
+#  - compact.yml does a second "Checkout base" (ref: main); we mirror the repo locally
+#    and repoint origin to file://, so act's checkout fetches base with no GitHub auth.
+#    A dummy GITHUB_TOKEN value only satisfies checkout's required input (never used).
+#
+# Dropped from the matrix: pr-title.yml (title-lint that mutates the PR), book.yml
+# (GitHub Pages deploy) — not code CI, and both require a real token.
 
 jobs:
   act:
@@ -37,7 +43,15 @@ jobs:
               echo '    - run: echo "sccache disabled (act stub)"'
               echo '      shell: bash'
             } > /tmp/noop-sccache/action.yml
-            cat /tmp/noop-sccache/action.yml
+      - run:
+          name: Provide base ref offline (compact.yml checks out base)
+          command: |
+            if [ "<< parameters.wf >>" = "compact.yml" ]; then
+              git fetch --no-tags --depth=1 origin main:main || git fetch --no-tags origin main || true
+              git clone --mirror . ./.basemirror.git
+              git remote set-url origin "file://$PWD/.basemirror.git"
+              echo "origin repointed to $(git remote get-url origin)"
+            fi
       - run:
           name: Run << parameters.wf >> via act
           no_output_timeout: 45m
@@ -45,6 +59,7 @@ jobs:
             act pull_request -W ".github/workflows/<< parameters.wf >>" \
               -P ubuntu-latest=catthehacker/ubuntu:act-latest \
               --env RUSTC_WRAPPER= \
+              -s GITHUB_TOKEN=act-local-dummy \
               --local-repository "mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696=/tmp/noop-sccache"
 
 workflows:
@@ -56,12 +71,10 @@ workflows:
             parameters:
               wf:
                 - lint-actions.yml
-                - pr-title.yml
                 - lint.yml
                 - unit.yml
                 - compact.yml
                 - grafana.yml
-                - book.yml
                 - stage.yml
                 - e2e.yml
                 - integration.yml
