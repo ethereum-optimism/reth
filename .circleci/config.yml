@@ -3,11 +3,6 @@ version: 2.1
 # Run the fork's OWN GitHub Actions workflows against the PR commit via nektos/act,
 # on CircleCI compute (Actions stays disabled on this repo). One CircleCI job per
 # PR-triggered reth workflow, run in parallel; each executes the PR's real workflow file.
-#
-# Exception: pr-title.yml is validated natively (below), NOT via act. It checks PR
-# metadata (title), and its workflow mutates the PR (sticky comments) + needs a write
-# token — unsafe to hand to act-executed untrusted PR code. Same allowed types as the
-# workflow, so the gate is equivalent without the credential-exposure / PR mutation.
 
 jobs:
   act:
@@ -32,33 +27,16 @@ jobs:
             act pull_request -W ".github/workflows/<< parameters.wf >>" \
               -P ubuntu-latest=catthehacker/ubuntu:act-latest
 
-  conventional-title:
-    docker:
-      - image: cimg/base:2024.05
-    steps:
-      - run:
-          name: Validate PR title is Conventional Commit (native, read-only, no mutation)
-          command: |
-            set -euo pipefail
-            if [ -z "${CIRCLE_BRANCH:-}" ]; then echo "no branch; skipping"; exit 0; fi
-            PR=$(curl -s "https://api.github.com/repos/ethereum-optimism/reth/pulls?head=ethereum-optimism:${CIRCLE_BRANCH}&state=open")
-            TITLE=$(printf '%s' "$PR" | python3 -c "import sys,json;a=json.load(sys.stdin);print(a[0]['title'] if a else '')")
-            echo "PR title: ${TITLE}"
-            if [ -z "${TITLE}" ]; then echo "no open PR for branch; skipping"; exit 0; fi
-            echo "${TITLE}" | grep -qiE '^(feat|fix|chore|test|bench|perf|refactor|docs|ci|revert|deps)(\([^)]+\))?!?: .+' \
-              && echo "OK: valid Conventional Commit title" \
-              || { echo "INVALID: title must start with one of feat|fix|chore|test|bench|perf|refactor|docs|ci|revert|deps"; exit 1; }
-
 workflows:
   reth-act-all:
     jobs:
-      - conventional-title
       - act:
           name: "act-<< matrix.wf >>"
           matrix:
             parameters:
               wf:
                 - lint-actions.yml
+                - pr-title.yml
                 - lint.yml
                 - unit.yml
                 - compact.yml
