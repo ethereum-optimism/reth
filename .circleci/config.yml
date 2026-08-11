@@ -1,0 +1,30 @@
+version: 2.1
+
+# POC: run the fork's OWN GitHub Actions workflows against the PR commit,
+# via nektos/act, on CircleCI compute — because Actions is disabled on this repo.
+# The CI executed is the PR's real .github/workflows, no reimplementation.
+
+jobs:
+  reth-ci-via-act:
+    machine:
+      image: ubuntu-2404:current
+    resource_class: large
+    steps:
+      - checkout
+      - run:
+          name: Install act
+          command: |
+            curl -fsSL https://raw.githubusercontent.com/nektos/act/master/install.sh \
+              | sudo bash -s -- -b /usr/local/bin
+            act --version
+      - run:
+          name: Run reth lint/fmt job via act (the PR's own workflow file)
+          command: |
+            act pull_request \
+              -W .github/workflows/lint.yml -j fmt \
+              -P ubuntu-latest=catthehacker/ubuntu:act-latest
+
+workflows:
+  reth-act-poc:
+    jobs:
+      - reth-ci-via-act
