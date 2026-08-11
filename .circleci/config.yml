@@ -18,12 +18,10 @@ jobs:
               | sudo bash -s -- -b /usr/local/bin
             act --version
       - run:
-          name: Run reth lint/fmt job via act (the PR's own workflow file)
+          name: Run reth actionlint job via act (the PR's own workflow file)
           command: |
-            act pull_request \
-              -W .github/workflows/lint.yml -j fmt \
+            act pull_request -W .github/workflows/lint-actions.yml -j actionlint \
               -P ubuntu-latest=catthehacker/ubuntu:act-latest
-
 workflows:
   reth-act-poc:
     jobs:
