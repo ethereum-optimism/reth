@@ -1,11 +1,14 @@
 version: 2.1
 
-# POC: run the fork's OWN GitHub Actions workflows against the PR commit,
-# via nektos/act, on CircleCI compute — because Actions is disabled on this repo.
-# The CI executed is the PR's real .github/workflows, no reimplementation.
+# Run the fork's OWN GitHub Actions workflows against the PR commit via nektos/act,
+# on CircleCI compute (Actions stays disabled on this repo). One CircleCI job per
+# PR-triggered reth workflow, run in parallel; each executes the PR's real workflow file.
 
 jobs:
-  reth-ci-via-act:
+  act:
+    parameters:
+      wf:
+        type: string
     machine:
       image: ubuntu-2404:current
     resource_class: large
@@ -18,11 +21,27 @@ jobs:
               | sudo bash -s -- -b /usr/local/bin
             act --version
       - run:
-          name: Run reth actionlint job via act (the PR's own workflow file)
+          name: Run << parameters.wf >> via act
+          no_output_timeout: 45m
           command: |
-            act pull_request -W .github/workflows/lint-actions.yml -j actionlint \
+            act pull_request -W ".github/workflows/<< parameters.wf >>" \
               -P ubuntu-latest=catthehacker/ubuntu:act-latest
+
 workflows:
-  reth-act-poc:
+  reth-act-all:
     jobs:
-      - reth-ci-via-act
+      - act:
+          name: "act-<< matrix.wf >>"
+          matrix:
+            parameters:
+              wf:
+                - lint-actions.yml
+                - pr-title.yml
+                - lint.yml
+                - unit.yml
+                - compact.yml
+                - grafana.yml
+                - book.yml
+                - stage.yml
+                - e2e.yml
+                - integration.yml
