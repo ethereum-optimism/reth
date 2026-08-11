@@ -3,6 +3,10 @@ version: 2.1
 # Run the fork's OWN GitHub Actions workflows against the PR commit via nektos/act,
 # on CircleCI compute (Actions stays disabled on this repo). One CircleCI job per
 # PR-triggered reth workflow, run in parallel; each executes the PR's real workflow file.
+#
+# sccache is disabled at the act layer (remap mozilla-actions/sccache-action -> no-op +
+# unset RUSTC_WRAPPER). It's only a compiler cache, not a check; disabling it avoids
+# needing a GITHUB_TOKEN (which we must not expose to act-executed untrusted PR code).
 
 jobs:
   act:
@@ -21,11 +25,27 @@ jobs:
               | sudo bash -s -- -b /usr/local/bin
             act --version
       - run:
+          name: Stub sccache-action (disable; avoids GITHUB_TOKEN)
+          command: |
+            mkdir -p /tmp/noop-sccache
+            {
+              echo 'name: noop-sccache'
+              echo 'description: disabled sccache (act stub)'
+              echo 'runs:'
+              echo '  using: composite'
+              echo '  steps:'
+              echo '    - run: echo "sccache disabled (act stub)"'
+              echo '      shell: bash'
+            } > /tmp/noop-sccache/action.yml
+            cat /tmp/noop-sccache/action.yml
+      - run:
           name: Run << parameters.wf >> via act
           no_output_timeout: 45m
           command: |
             act pull_request -W ".github/workflows/<< parameters.wf >>" \
-              -P ubuntu-latest=catthehacker/ubuntu:act-latest
+              -P ubuntu-latest=catthehacker/ubuntu:act-latest \
+              --env RUSTC_WRAPPER= \
+              --local-repository "mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696=/tmp/noop-sccache"
 
 workflows:
   reth-act-all:
