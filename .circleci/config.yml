@@ -4,9 +4,10 @@ version: 2.1
 # on CircleCI compute (Actions stays disabled on this repo). One CircleCI job per
 # PR-triggered reth workflow, in parallel; each runs the PR's real workflow file.
 #
-# Security: CircleCI config and GitHub workflows both come from the PR, so this job receives
-# no CircleCI contexts or credentials. Public repositories are fetched anonymously; a
-# non-credential placeholder only satisfies actions that require a GITHUB_TOKEN input.
+# Auth: the `circleci-repo-readonly-authenticated-github-token` context provides a token
+# scoped to read-only access for this repository. Because PR-controlled code receives it,
+# the context must remain restricted to trusted contributors; untrusted PRs must not run
+# these jobs.
 #
 # act receives the real pull-request payload so workflow expressions (especially base_ref)
 # match GitHub Actions. act, its archive checksum, and the runner image are pinned.
@@ -87,13 +88,15 @@ jobs:
               --eventpath /tmp/pull-request-event.json \
               -P "ubuntu-latest=catthehacker/ubuntu@sha256:b839c14c4410998529ec18f951262bdf87a2b23bc1467304d07b491b9455e074" \
               --env RUSTC_WRAPPER= \
-              -s GITHUB_TOKEN=public-repositories-only \
+              -s GITHUB_TOKEN="${MISE_GITHUB_TOKEN:?missing restricted read-only GitHub token}" \
               --local-repository "mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696=/tmp/noop-sccache"
 
 workflows:
   reth-act-all:
     jobs:
       - act:
+          context:
+            - circleci-repo-readonly-authenticated-github-token
           name: "act-<< matrix.wf >>"
           matrix:
             parameters:
