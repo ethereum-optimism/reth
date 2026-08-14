@@ -4,10 +4,12 @@ version: 2.1
 # on CircleCI compute (Actions stays disabled on this repo). One CircleCI job per
 # PR-triggered reth workflow, in parallel; each runs the PR's real workflow file.
 #
-# Auth: the org's reusable read-only context `circleci-repo-readonly-authenticated-github-token`
-# injects MISE_GITHUB_TOKEN (authenticated read-only). We pass it to act as GITHUB_TOKEN so
-# act's runtime action fetches aren't anonymously rate-limited and checkout can fetch base
-# refs. Read-only scope => safe to expose to act-executed PR code.
+# Security: CircleCI config and GitHub workflows both come from the PR, so this job receives
+# no CircleCI contexts or credentials. Public repositories are fetched anonymously; a
+# non-credential placeholder only satisfies actions that require a GITHUB_TOKEN input.
+#
+# act receives the real pull-request payload so workflow expressions (especially base_ref)
+# match GitHub Actions. act, its archive checksum, and the runner image are pinned.
 #
 # sccache stays disabled (remap sccache-action -> no-op + unset RUSTC_WRAPPER); it's a
 # compiler cache, not a check, and its GHA cache backend doesn't exist under act.
@@ -21,16 +23,49 @@ jobs:
       wf:
         type: string
     machine:
-      image: ubuntu-2404:current
+      image: ubuntu-2404:2025.09.1
     resource_class: large
     steps:
       - checkout
       - run:
-          name: Install act
+          name: Prepare pull request event
           command: |
-            curl -fsSL https://raw.githubusercontent.com/nektos/act/master/install.sh \
-              | sudo bash -s -- -b /usr/local/bin
-            act --version
+            set -euo pipefail
+            : "${CIRCLE_PULL_REQUEST:?CircleCI must be configured to build pull requests only}"
+            : "${CIRCLE_SHA1:?missing CircleCI revision}"
+
+            pr_number="${CIRCLE_PULL_REQUEST##*/}"
+            api_url="https://api.github.com/repos/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}/pulls/${pr_number}"
+            curl --fail --silent --show-error --location \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$api_url" > /tmp/pull-request.json
+            jq --arg head_sha "$CIRCLE_SHA1" '
+              .head.sha = $head_sha |
+              {
+                action: "synchronize",
+                number: .number,
+                pull_request: .,
+                repository: .base.repo,
+                sender: .user
+              }
+            ' /tmp/pull-request.json > /tmp/pull-request-event.json
+            head_ref="$(jq -r '.pull_request.head.ref' /tmp/pull-request-event.json)"
+            base_ref="$(jq -r '.pull_request.base.ref' /tmp/pull-request-event.json)"
+            echo "act event: PR #${pr_number}, ${head_ref} -> ${base_ref}"
+      - run:
+          name: Install pinned act
+          command: |
+            set -euo pipefail
+            readonly ACT_VERSION="0.2.89"
+            readonly ACT_ARCHIVE="act_Linux_x86_64.tar.gz"
+            readonly ACT_SHA256="0191d6f1f3b716b5c55820032605d05fc3c1cdbf581ebeff655019e5dd1524c0"
+            curl --fail --silent --show-error --location \
+              "https://github.com/nektos/act/releases/download/v${ACT_VERSION}/${ACT_ARCHIVE}" \
+              --output "/tmp/${ACT_ARCHIVE}"
+            echo "${ACT_SHA256}  /tmp/${ACT_ARCHIVE}" | sha256sum --check
+            sudo tar --extract --gzip --file "/tmp/${ACT_ARCHIVE}" --directory /usr/local/bin act
+            test "$(act --version)" = "act version ${ACT_VERSION}"
       - run:
           name: Stub sccache-action (disable; not a check)
           command: |
@@ -49,17 +84,16 @@ jobs:
           no_output_timeout: 45m
           command: |
             act pull_request -W ".github/workflows/<< parameters.wf >>" \
-              -P ubuntu-latest=catthehacker/ubuntu:act-latest \
+              --eventpath /tmp/pull-request-event.json \
+              -P "ubuntu-latest=catthehacker/ubuntu@sha256:b839c14c4410998529ec18f951262bdf87a2b23bc1467304d07b491b9455e074" \
               --env RUSTC_WRAPPER= \
-              -s GITHUB_TOKEN="${MISE_GITHUB_TOKEN:?context circleci-repo-readonly-authenticated-github-token must be attached}" \
+              -s GITHUB_TOKEN=public-repositories-only \
               --local-repository "mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696=/tmp/noop-sccache"
 
 workflows:
   reth-act-all:
     jobs:
       - act:
-          context:
-            - circleci-repo-readonly-authenticated-github-token
           name: "act-<< matrix.wf >>"
           matrix:
             parameters:
