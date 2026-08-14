@@ -16,6 +16,9 @@ version: 2.1
 # compiler cache, not a check, and its GHA cache backend doesn't exist under act. Pages
 # setup/artifact actions are also no-ops after book.yml completes its validation build.
 #
+# act v0.2.89 has a race when parallel jobs populate its shared GoGit action cache. Keep
+# internal jobs sequential until act synchronizes cache reads/writes or we carry that patch.
+#
 # Excluded: pr-title.yml and label-pr.yml mutate PR metadata, while cyclops-audit.yml is a
 # privileged label/comment integration. book.yml remains included for its validation build;
 # its deployment job is skipped for pull_request and merge_group events.
@@ -153,6 +156,7 @@ jobs:
             act "$event_name" -W ".github/workflows/<< parameters.wf >>" \
               --eventpath /tmp/github-event.json \
               -P "ubuntu-latest=catthehacker/ubuntu@sha256:b839c14c4410998529ec18f951262bdf87a2b23bc1467304d07b491b9455e074" \
+              --concurrent-jobs 1 \
               "${act_env[@]}" \
               -s GITHUB_TOKEN="${MISE_GITHUB_TOKEN:?missing restricted read-only GitHub token}" \
               --local-repository "mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696=/tmp/noop-sccache" \
