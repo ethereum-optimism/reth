@@ -188,7 +188,7 @@ workflows:
           event: merge_group
           context:
             - circleci-repo-readonly-authenticated-github-token
-          name: "act-<< matrix.wf >>"
+          name: "merge-act-<< matrix.wf >>"
           matrix:
             parameters:
               wf:
