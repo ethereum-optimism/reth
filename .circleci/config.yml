@@ -1,59 +1,105 @@
 version: 2.1
 
-# Run the fork's OWN GitHub Actions workflows against the PR commit via nektos/act,
-# on CircleCI compute (Actions stays disabled on this repo). One CircleCI job per
-# PR-triggered reth workflow, in parallel; each runs the PR's real workflow file.
+# Run the fork's OWN GitHub Actions workflows via nektos/act on CircleCI compute
+# (Actions stays disabled on this repo). Pull requests run the non-mutating validation
+# workflows; merge-queue commits run the same checks plus merge-group-only validation.
 #
 # Auth: the `circleci-repo-readonly-authenticated-github-token` context provides a token
 # scoped to read-only access for this repository. Because PR-controlled code receives it,
 # the context must remain restricted to trusted contributors; untrusted PRs must not run
 # these jobs.
 #
-# act receives the real pull-request payload so workflow expressions (especially base_ref)
-# match GitHub Actions. act, its archive checksum, and the runner image are pinned.
+# act receives an event payload for the current trigger so workflow expressions (especially
+# base_ref) match GitHub Actions. act, its archive checksum, and the runner image are pinned.
 #
 # sccache stays disabled (remap sccache-action -> no-op + unset RUSTC_WRAPPER); it's a
-# compiler cache, not a check, and its GHA cache backend doesn't exist under act.
+# compiler cache, not a check, and its GHA cache backend doesn't exist under act. Pages
+# setup/artifact actions are also no-ops after book.yml completes its validation build.
 #
-# Dropped from the matrix: pr-title.yml (title-lint that mutates the PR) and book.yml
-# (GitHub Pages deploy) — not code CI.
+# Excluded: pr-title.yml and label-pr.yml mutate PR metadata, while cyclops-audit.yml is a
+# privileged label/comment integration. book.yml remains included for its validation build;
+# its deployment job is skipped for pull_request and merge_group events.
 
 jobs:
   act:
     parameters:
       wf:
         type: string
+      event:
+        type: enum
+        enum: [pull_request, merge_group]
     machine:
       image: ubuntu-2404:2025.09.1
     resource_class: large
     steps:
       - checkout
       - run:
-          name: Prepare pull request event
+          name: Prepare GitHub event
           command: |
             set -euo pipefail
-            : "${CIRCLE_PULL_REQUEST:?CircleCI must be configured to build pull requests only}"
             : "${CIRCLE_SHA1:?missing CircleCI revision}"
+            event_name="<< parameters.event >>"
+            repository="${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}"
 
-            pr_number="${CIRCLE_PULL_REQUEST##*/}"
-            api_url="https://api.github.com/repos/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}/pulls/${pr_number}"
-            curl --fail --silent --show-error --location \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "$api_url" > /tmp/pull-request.json
-            jq --arg head_sha "$CIRCLE_SHA1" '
-              .head.sha = $head_sha |
-              {
-                action: "synchronize",
-                number: .number,
-                pull_request: .,
-                repository: .base.repo,
-                sender: .user
-              }
-            ' /tmp/pull-request.json > /tmp/pull-request-event.json
-            head_ref="$(jq -r '.pull_request.head.ref' /tmp/pull-request-event.json)"
-            base_ref="$(jq -r '.pull_request.base.ref' /tmp/pull-request-event.json)"
-            echo "act event: PR #${pr_number}, ${head_ref} -> ${base_ref}"
+            case "$event_name" in
+              pull_request)
+                : "${CIRCLE_PULL_REQUEST:?pull-request trigger must provide CIRCLE_PULL_REQUEST}"
+                pr_number="${CIRCLE_PULL_REQUEST##*/}"
+                api_url="https://api.github.com/repos/${repository}/pulls/${pr_number}"
+                curl --fail --silent --show-error --location \
+                  -H "Accept: application/vnd.github+json" \
+                  -H "X-GitHub-Api-Version: 2022-11-28" \
+                  "$api_url" > /tmp/pull-request.json
+                jq --arg head_sha "$CIRCLE_SHA1" '
+                  .head.sha = $head_sha |
+                  {
+                    action: "synchronize",
+                    number: .number,
+                    pull_request: .,
+                    repository: .base.repo,
+                    sender: .user
+                  }
+                ' /tmp/pull-request.json > /tmp/github-event.json
+                head_ref="$(jq -r '.pull_request.head.ref' /tmp/github-event.json)"
+                base_ref="$(jq -r '.pull_request.base.ref' /tmp/github-event.json)"
+                echo "act event: pull_request #${pr_number}, ${head_ref} -> ${base_ref}"
+                ;;
+              merge_group)
+                : "${CIRCLE_BRANCH:?merge-queue trigger must provide CIRCLE_BRANCH}"
+                if [[ ! "$CIRCLE_BRANCH" =~ ^gh-readonly-queue/([^/]+)/ ]]; then
+                  echo "merge_group requires a gh-readonly-queue branch, got: ${CIRCLE_BRANCH}" >&2
+                  exit 1
+                fi
+                base_ref="${BASH_REMATCH[1]}"
+                base_sha="$(git ls-remote origin "refs/heads/${base_ref}" | awk 'NR == 1 {print $1}')"
+                : "${base_sha:?unable to resolve merge-queue base SHA}"
+                jq -n \
+                  --arg head_sha "$CIRCLE_SHA1" \
+                  --arg head_ref "refs/heads/${CIRCLE_BRANCH}" \
+                  --arg base_sha "$base_sha" \
+                  --arg base_ref "refs/heads/${base_ref}" \
+                  --arg repository "$repository" \
+                  --arg repository_name "$CIRCLE_PROJECT_REPONAME" \
+                  --arg repository_owner "$CIRCLE_PROJECT_USERNAME" \
+                  '{
+                    action: "checks_requested",
+                    merge_group: {
+                      head_sha: $head_sha,
+                      head_ref: $head_ref,
+                      base_sha: $base_sha,
+                      base_ref: $base_ref
+                    },
+                    repository: {
+                      full_name: $repository,
+                      name: $repository_name,
+                      owner: {login: $repository_owner}
+                    }
+                  }' > /tmp/github-event.json
+                echo "act event: merge_group ${CIRCLE_BRANCH} -> ${base_ref}"
+                ;;
+            esac
+
+            printf '%s' "$base_ref" > /tmp/act-base-ref
       - run:
           name: Install pinned act
           command: |
@@ -68,9 +114,9 @@ jobs:
             sudo tar --extract --gzip --file "/tmp/${ACT_ARCHIVE}" --directory /usr/local/bin act
             test "$(act --version)" = "act version ${ACT_VERSION}"
       - run:
-          name: Stub sccache-action (disable; not a check)
+          name: Stub unsupported non-check actions
           command: |
-            mkdir -p /tmp/noop-sccache
+            mkdir -p /tmp/noop-sccache /tmp/noop-pages
             {
               echo 'name: noop-sccache'
               echo 'description: disabled sccache (act stub)'
@@ -80,32 +126,81 @@ jobs:
               echo '    - run: echo "sccache disabled (act stub)"'
               echo '      shell: bash'
             } > /tmp/noop-sccache/action.yml
+            {
+              echo 'name: noop-pages'
+              echo 'description: disabled Pages setup/artifact plumbing (act stub)'
+              echo 'runs:'
+              echo '  using: composite'
+              echo '  steps:'
+              echo '    - run: echo "Pages plumbing disabled after validation build (act stub)"'
+              echo '      shell: bash'
+            } > /tmp/noop-pages/action.yml
       - run:
           name: Run << parameters.wf >> via act
           no_output_timeout: 45m
           command: |
-            act pull_request -W ".github/workflows/<< parameters.wf >>" \
-              --eventpath /tmp/pull-request-event.json \
+            set -euo pipefail
+            event_name="<< parameters.event >>"
+            base_ref="$(cat /tmp/act-base-ref)"
+            act_env=(--env "RUSTC_WRAPPER=" --env "GITHUB_BASE_REF=${base_ref}")
+            if [ "$event_name" = "merge_group" ]; then
+              act_env+=(
+                --env "GITHUB_REF=refs/heads/${CIRCLE_BRANCH}"
+                --env "GITHUB_SHA=${CIRCLE_SHA1}"
+              )
+            fi
+
+            act "$event_name" -W ".github/workflows/<< parameters.wf >>" \
+              --eventpath /tmp/github-event.json \
               -P "ubuntu-latest=catthehacker/ubuntu@sha256:b839c14c4410998529ec18f951262bdf87a2b23bc1467304d07b491b9455e074" \
-              --env RUSTC_WRAPPER= \
+              "${act_env[@]}" \
               -s GITHUB_TOKEN="${MISE_GITHUB_TOKEN:?missing restricted read-only GitHub token}" \
-              --local-repository "mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696=/tmp/noop-sccache"
+              --local-repository "mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696=/tmp/noop-sccache" \
+              --local-repository "actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d=/tmp/noop-pages" \
+              --local-repository "actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9=/tmp/noop-pages"
 
 workflows:
-  reth-act-all:
+  reth-act-pull-request:
     jobs:
       - act:
+          event: pull_request
           context:
             - circleci-repo-readonly-authenticated-github-token
           name: "act-<< matrix.wf >>"
           matrix:
             parameters:
               wf:
+                - book.yml
+                - compact.yml
+                - e2e.yml
+                - grafana.yml
+                - integration.yml
                 - lint-actions.yml
                 - lint.yml
                 - unit.yml
+          filters:
+            branches:
+              ignore: /gh-readonly-queue\/.*/
+
+  reth-act-merge-queue:
+    jobs:
+      - act:
+          event: merge_group
+          context:
+            - circleci-repo-readonly-authenticated-github-token
+          name: "act-<< matrix.wf >>"
+          matrix:
+            parameters:
+              wf:
+                - book.yml
                 - compact.yml
-                - grafana.yml
-                - stage.yml
                 - e2e.yml
+                - grafana.yml
                 - integration.yml
+                - lint-actions.yml
+                - lint.yml
+                - stage.yml
+                - unit.yml
+          filters:
+            branches:
+              only: /gh-readonly-queue\/.*/
