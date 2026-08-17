@@ -14,7 +14,7 @@ use alloy_rlp::{
     RlpEncodableWrapper,
 };
 use core::{fmt::Debug, mem};
-use derive_more::{Constructor, Deref, DerefMut, From, IntoIterator};
+use derive_more::{Deref, DerefMut, From, IntoIterator};
 use reth_codecs_derive::{add_arbitrary_tests, generate_tests};
 use reth_ethereum_primitives::TransactionSigned;
 use reth_primitives_traits::{sync::OnceLock, Block, InMemorySize, SignedTransaction};
@@ -1262,7 +1262,7 @@ impl HandleVersionedMempoolData for ValidAnnouncementData {
 }
 
 /// Hashes to request from a peer.
-#[derive(Debug, Default, Deref, DerefMut, IntoIterator, Constructor)]
+#[derive(Debug, Default, Deref, DerefMut, IntoIterator)]
 pub struct RequestTxHashes {
     #[deref]
     #[deref_mut]
@@ -1271,6 +1271,11 @@ pub struct RequestTxHashes {
 }
 
 impl RequestTxHashes {
+    /// Creates a new collection of transaction hashes to request.
+    pub const fn new(hashes: B256Set) -> Self {
+        Self { hashes }
+    }
+
     /// Returns a new [`RequestTxHashes`] with given capacity for hashes. Caution! Make sure to
     /// call `shrink_to_fit` on [`RequestTxHashes`] when full, especially where it will
     /// be stored in its entirety like in the future waiting for a
