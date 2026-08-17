@@ -68,12 +68,9 @@ impl WorkerThread {
         let task: BoxedTask = Box::new(move || {
             let started_at = Instant::now();
             metrics.record_queue_wait(started_at.saturating_duration_since(queued_at));
-            let result = {
-                let _decrement_pending = DecrementPendingOnDrop(pending);
-                let _record_task_duration = RecordTaskDurationOnDrop::new(metrics, started_at);
-                f()
-            };
-            let _ = result_tx.send(result);
+            let _decrement_pending = DecrementPendingOnDrop(pending);
+            let _record_task_duration = RecordTaskDurationOnDrop::new(metrics, started_at);
+            let _ = result_tx.send(f());
         });
 
         if self.tx.send(task).is_err() {
@@ -99,12 +96,9 @@ impl WorkerThread {
         let task: BoxedTask = Box::new(move || {
             let started_at = Instant::now();
             metrics.record_queue_wait(started_at.saturating_duration_since(queued_at));
-            let result = {
-                let _decrement_pending = DecrementPendingOnDrop(pending);
-                let _record_task_duration = RecordTaskDurationOnDrop::new(metrics, started_at);
-                f()
-            };
-            let _ = result_tx.send(result);
+            let _decrement_pending = DecrementPendingOnDrop(pending);
+            let _record_task_duration = RecordTaskDurationOnDrop::new(metrics, started_at);
+            let _ = result_tx.send(f());
         });
 
         if self.tx.send(task).is_err() {
