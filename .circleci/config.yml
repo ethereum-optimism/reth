@@ -18,6 +18,8 @@ version: 2.1
 #
 # act v0.2.89 has a race when parallel jobs populate its shared GoGit action cache. Keep
 # internal jobs sequential until act synchronizes cache reads/writes or we carry that patch.
+# unit.yml uses an xlarge machine because its EF/EEST state tests need the same 8-core class
+# as the upstream workflow and exceed the large machine's memory/time budget without sccache.
 #
 # Excluded: pr-title.yml and label-pr.yml mutate PR metadata, while cyclops-audit.yml is a
 # privileged label/comment integration. book.yml remains included for its validation build;
@@ -31,9 +33,13 @@ jobs:
       event:
         type: enum
         enum: [pull_request, merge_group]
+      resource:
+        type: enum
+        enum: [large, xlarge]
+        default: large
     machine:
       image: ubuntu-2404:2025.09.1
-    resource_class: large
+    resource_class: << parameters.resource >>
     steps:
       - checkout
       - run:
@@ -181,7 +187,16 @@ workflows:
                 - integration.yml
                 - lint-actions.yml
                 - lint.yml
-                - unit.yml
+          filters:
+            branches:
+              ignore: /gh-readonly-queue\/.*/
+      - act:
+          event: pull_request
+          wf: unit.yml
+          resource: xlarge
+          context:
+            - circleci-repo-readonly-authenticated-github-token
+          name: act-unit.yml
           filters:
             branches:
               ignore: /gh-readonly-queue\/.*/
@@ -204,7 +219,16 @@ workflows:
                 - lint-actions.yml
                 - lint.yml
                 - stage.yml
-                - unit.yml
+          filters:
+            branches:
+              only: /gh-readonly-queue\/.*/
+      - act:
+          event: merge_group
+          wf: unit.yml
+          resource: xlarge
+          context:
+            - circleci-repo-readonly-authenticated-github-token
+          name: merge-act-unit.yml
           filters:
             branches:
               only: /gh-readonly-queue\/.*/
