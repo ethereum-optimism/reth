@@ -7,7 +7,8 @@ version: 2.1
 # Auth: the `circleci-repo-readonly-authenticated-github-token` context provides a token
 # scoped to read-only access for this repository. Because PR-controlled code receives it,
 # the context must remain restricted to trusted contributors; untrusted PRs must not run
-# these jobs.
+# these jobs. CircleCI's "Auto-cancel redundant workflows" project setting must be enabled
+# so superseded PR revisions stop consuming machines.
 #
 # act receives an event payload for the current trigger so workflow expressions (especially
 # base_ref) match GitHub Actions. act, its archive checksum, and the runner image are pinned.
@@ -32,9 +33,6 @@ jobs:
     parameters:
       wf:
         type: string
-      event:
-        type: enum
-        enum: [pull_request, merge_group]
       resource:
         type: enum
         enum: [large, xlarge]
@@ -55,7 +53,11 @@ jobs:
           command: |
             set -euo pipefail
             : "${CIRCLE_SHA1:?missing CircleCI revision}"
-            event_name="<< parameters.event >>"
+            if [[ "${CIRCLE_BRANCH:-}" == gh-readonly-queue/* ]]; then
+              event_name="merge_group"
+            else
+              event_name="pull_request"
+            fi
             repository="${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}"
 
             case "$event_name" in
@@ -118,6 +120,7 @@ jobs:
             esac
 
             printf '%s' "$base_ref" > /tmp/act-base-ref
+            printf '%s' "$event_name" > /tmp/act-event-name
       - run:
           name: Install pinned act
           command: |
@@ -173,14 +176,19 @@ jobs:
           no_output_timeout: 45m
           command: |
             set -euo pipefail
-            event_name="<< parameters.event >>"
+            event_name="$(cat /tmp/act-event-name)"
             base_ref="$(cat /tmp/act-base-ref)"
             target_job="<< parameters.job >>"
             act_job=()
             if [ -n "$target_job" ]; then
               case "$target_job" in
-                crate-checks-[123])
-                  act_job=(-j crate-checks --matrix "partition:${target_job##*-}")
+                crate-checks-*)
+                  partition="${target_job#crate-checks-}"
+                  if [[ ! "$partition" =~ ^[1-9][0-9]*$ ]]; then
+                    echo "invalid crate-checks partition: $partition" >&2
+                    exit 1
+                  fi
+                  act_job=(-j crate-checks --matrix "partition:${partition}")
                   ;;
                 *)
                   act_job=(-j "$target_job")
@@ -232,14 +240,10 @@ jobs:
           command: .circleci/check-act-shards.sh
 
 workflows:
-  reth-act-pull-request:
+  reth-act:
     jobs:
-      - validate-act-shards:
-          filters:
-            branches:
-              ignore: /gh-readonly-queue\/.*/
+      - validate-act-shards
       - act:
-          event: pull_request
           context:
             - circleci-repo-readonly-authenticated-github-token
           name: "act-<< matrix.wf >>"
@@ -252,11 +256,8 @@ workflows:
                 - grafana.yml
                 - integration.yml
                 - lint-actions.yml
-          filters:
-            branches:
-              ignore: /gh-readonly-queue\/.*/
+                - stage.yml
       - act:
-          event: pull_request
           wf: lint.yml
           concurrent_jobs: 1
           context:
@@ -266,7 +267,7 @@ workflows:
             - validate-act-shards
           matrix:
             parameters:
-              job: &lint_jobs
+              job:
                 - clippy-binaries
                 - clippy
                 - wasm
@@ -285,11 +286,7 @@ workflows:
                 - no-test-deps
                 - feature-propagation
                 - deny
-          filters:
-            branches:
-              ignore: /gh-readonly-queue\/.*/
       - act:
-          event: pull_request
           wf: unit.yml
           resource: xlarge
           concurrent_jobs: 1
@@ -300,67 +297,7 @@ workflows:
             - validate-act-shards
           matrix:
             parameters:
-              job: &unit_jobs
+              job:
                 - test
                 - state
                 - doc
-          filters:
-            branches:
-              ignore: /gh-readonly-queue\/.*/
-
-  reth-act-merge-queue:
-    jobs:
-      - validate-act-shards:
-          name: merge-validate-act-shards
-          filters:
-            branches:
-              only: /gh-readonly-queue\/.*/
-      - act:
-          event: merge_group
-          context:
-            - circleci-repo-readonly-authenticated-github-token
-          name: "merge-act-<< matrix.wf >>"
-          matrix:
-            parameters:
-              wf:
-                - book.yml
-                - compact.yml
-                - e2e.yml
-                - grafana.yml
-                - integration.yml
-                - lint-actions.yml
-                - stage.yml
-          filters:
-            branches:
-              only: /gh-readonly-queue\/.*/
-      - act:
-          event: merge_group
-          wf: lint.yml
-          concurrent_jobs: 1
-          context:
-            - circleci-repo-readonly-authenticated-github-token
-          name: "merge-act-lint-<< matrix.job >>"
-          requires:
-            - merge-validate-act-shards
-          matrix:
-            parameters:
-              job: *lint_jobs
-          filters:
-            branches:
-              only: /gh-readonly-queue\/.*/
-      - act:
-          event: merge_group
-          wf: unit.yml
-          resource: xlarge
-          concurrent_jobs: 1
-          context:
-            - circleci-repo-readonly-authenticated-github-token
-          name: "merge-act-unit-<< matrix.job >>"
-          requires:
-            - merge-validate-act-shards
-          matrix:
-            parameters:
-              job: *unit_jobs
-          filters:
-            branches:
-              only: /gh-readonly-queue\/.*/
