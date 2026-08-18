@@ -5,10 +5,9 @@ readonly OUTPUT_DIR="${ACT_EVENT_OUTPUT_DIR:-/tmp/act-event}"
 readonly EVENT_PATH="${OUTPUT_DIR}/github-event.json"
 readonly EVENT_NAME_PATH="${OUTPUT_DIR}/event-name"
 readonly BASE_REF_PATH="${OUTPUT_DIR}/base-ref"
-readonly SUPERSEDED_PATH="${OUTPUT_DIR}/superseded"
 
 mkdir -p "$OUTPUT_DIR"
-rm -f "$EVENT_PATH" "$EVENT_NAME_PATH" "$BASE_REF_PATH" "$SUPERSEDED_PATH"
+rm -f "$EVENT_PATH" "$EVENT_NAME_PATH" "$BASE_REF_PATH"
 
 : "${CIRCLE_SHA1:?missing CircleCI revision}"
 : "${CIRCLE_PROJECT_USERNAME:?missing CircleCI project owner}"
@@ -51,10 +50,8 @@ case "$event_name" in
 
         event_head_sha="$(jq -r '.head.sha' "$pull_request_path")"
         if [[ "$event_head_sha" != "$CIRCLE_SHA1" ]]; then
-            printf 'PR head moved from CircleCI revision %s to %s\n' \
-                "$CIRCLE_SHA1" "$event_head_sha" > "$SUPERSEDED_PATH"
-            echo "$(cat "$SUPERSEDED_PATH"); treating this pipeline as superseded"
-            exit 0
+            echo "PR head does not match CircleCI revision: ${CIRCLE_SHA1} != ${event_head_sha}" >&2
+            exit 1
         fi
 
         jq '{

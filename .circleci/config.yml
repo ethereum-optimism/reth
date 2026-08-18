@@ -7,12 +7,12 @@ version: 2.1
 # Auth: the `circleci-repo-readonly-authenticated-github-token` context provides a token
 # scoped to read-only access for this repository. Because PR-controlled code receives it,
 # the context must remain restricted to trusted contributors; untrusted PRs must not run
-# these jobs. CircleCI's "Auto-cancel redundant workflows" project setting must be enabled
-# so superseded PR revisions stop consuming machines.
+# these jobs. CircleCI's "Auto-cancel redundant workflows" project setting must remain
+# enabled so older PR revisions stop consuming machines.
 #
 # A single preflight job snapshots the event for the exact CircleCI revision and distributes
-# it to every act shard. PR heads must still equal CIRCLE_SHA1; superseded pipelines stop
-# before installing tools. Merge-group base data comes from the queue commit's first parent.
+# it to every act shard. PR heads must equal CIRCLE_SHA1, while merge-group base data comes
+# from the queue commit's first parent.
 # act, its archive checksum, and the runner image are pinned.
 #
 # sccache and rust-cache stay disabled (remapped to no-ops + unset RUSTC_WRAPPER); they
@@ -77,9 +77,6 @@ jobs:
             if [ -f /tmp/act-event/failed ]; then
               cat /tmp/act-event/failed >&2
               exit 1
-            elif [ -f /tmp/act-event/superseded ]; then
-              cat /tmp/act-event/superseded
-              circleci-agent step halt
             fi
       - run:
           name: Install pinned act
