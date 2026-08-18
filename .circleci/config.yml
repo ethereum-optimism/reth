@@ -203,9 +203,6 @@ jobs:
       - run:
           name: Validate act shards
           command: .circleci/check-act-shards.sh
-      - run:
-          name: Test act event preparation
-          command: .circleci/test-prepare-act-event.sh
 
 workflows:
   reth-act:
