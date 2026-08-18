@@ -17,10 +17,9 @@ version: 2.1
 # setup/artifact actions are also no-ops after book.yml completes its validation build.
 #
 # The pinned ethereum-optimism/act build synchronizes access to its shared GoGit action
-# cache. Internal jobs are capped at two so workflows gain parallelism without
-# oversubscribing CircleCI machines. unit.yml uses an xlarge machine because its EF/EEST
-# state tests need the same 8-core class as upstream and exceed the large machine's
-# memory/time budget without sccache.
+# cache. Each workflow uses an 8-core xlarge machine and caps internal jobs at four to
+# limit memory and disk contention. The EF/EEST state tests also need this 8-core class;
+# they exceed a large machine's memory/time budget without sccache.
 #
 # Excluded: pr-title.yml and label-pr.yml mutate PR metadata, while cyclops-audit.yml is a
 # privileged label/comment integration. book.yml remains included for its validation build;
@@ -37,7 +36,7 @@ jobs:
       resource:
         type: enum
         enum: [large, xlarge]
-        default: large
+        default: xlarge
     machine:
       image: ubuntu-2404:2025.09.1
     resource_class: << parameters.resource >>
@@ -164,7 +163,7 @@ jobs:
             act "$event_name" -W ".github/workflows/<< parameters.wf >>" \
               --eventpath /tmp/github-event.json \
               -P "ubuntu-latest=catthehacker/ubuntu@sha256:b839c14c4410998529ec18f951262bdf87a2b23bc1467304d07b491b9455e074" \
-              --concurrent-jobs 2 \
+              --concurrent-jobs 4 \
               "${act_env[@]}" \
               -s GITHUB_TOKEN="${MISE_GITHUB_TOKEN:?missing restricted read-only GitHub token}" \
               --local-repository "mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696=/tmp/noop-sccache" \
