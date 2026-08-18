@@ -18,10 +18,10 @@ version: 2.1
 #
 # The pinned ethereum-optimism/act build synchronizes access to its shared GoGit action
 # cache. Lint jobs run on separate 8-core xlarge machines, matching GitHub's distributed
-# runner model instead of contending inside one machine. A preflight check fails if this
-# static shard list drifts from lint.yml. Other workflows run up to four internal jobs;
-# unit jobs remain sequential because concurrent full-workspace builds exhaust the
-# machine while EF/EEST state tests are running.
+# runner model instead of contending inside one machine. Unit jobs are likewise split
+# across separate xlarge machines to match upstream's distributed runners. A preflight
+# check fails if the static lint shard list drifts from lint.yml. Other workflows run up
+# to four internal jobs.
 #
 # Excluded: pr-title.yml and label-pr.yml mutate PR metadata, while cyclops-audit.yml is a
 # privileged label/comment integration. book.yml remains included for its validation build;
@@ -279,7 +279,13 @@ workflows:
           concurrent_jobs: 1
           context:
             - circleci-repo-readonly-authenticated-github-token
-          name: act-unit.yml
+          name: "act-unit-<< matrix.job >>"
+          matrix:
+            parameters:
+              job: &unit_jobs
+                - test
+                - state
+                - doc
           filters:
             branches:
               ignore: /gh-readonly-queue\/.*/
@@ -331,7 +337,10 @@ workflows:
           concurrent_jobs: 1
           context:
             - circleci-repo-readonly-authenticated-github-token
-          name: merge-act-unit.yml
+          name: "merge-act-unit-<< matrix.job >>"
+          matrix:
+            parameters:
+              job: *unit_jobs
           filters:
             branches:
               only: /gh-readonly-queue\/.*/
