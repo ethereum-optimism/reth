@@ -1,32 +1,17 @@
 version: 2.1
 
-# Run the fork's OWN GitHub Actions workflows via nektos/act on CircleCI compute
-# (Actions stays disabled on this repo). Pull requests run the non-mutating validation
-# workflows; merge-queue commits run the same checks plus merge-group-only validation.
+# Runs this fork's PR validation workflows through pinned act because GitHub Actions is
+# disabled. Merge queues run the same checks plus stage.yml. Event metadata is generated once
+# per CircleCI revision and shared by all shards.
 #
-# Auth: the `circleci-repo-readonly-authenticated-github-token` context provides a token
-# scoped to read-only access for this repository. Because PR-controlled code receives it,
-# the context must remain restricted to trusted contributors; untrusted PRs must not run
-# these jobs. CircleCI's "Auto-cancel redundant workflows" project setting must remain
-# enabled so older PR revisions stop consuming machines.
+# The read-only GitHub token is exposed to PR code, so its CircleCI context must remain
+# restricted to trusted contributors. Keep CircleCI auto-cancellation enabled.
 #
-# A single preflight job snapshots the event for the exact CircleCI revision and distributes
-# it to every act shard. PR heads must equal CIRCLE_SHA1, while merge-group base data comes
-# from the queue commit's first parent.
-# act, its archive checksum, and the runner image are pinned.
+# The act binary, checksum, and runner image are pinned. Compiler caches are no-ops because
+# act's local cache is not reusable across these machines; Pages plumbing is skipped after the
+# validation build. Lint and unit jobs are distributed; other workflows run up to four jobs.
 #
-# sccache and rust-cache stay disabled (remapped to no-ops + unset RUSTC_WRAPPER); they
-# are compiler caches, not checks, and their GHA cache backend is ephemeral under act.
-# Pages setup/artifact actions are also no-ops after book.yml completes its validation build.
-#
-# The pinned ethereum-optimism/act build synchronizes access to its shared GoGit action
-# cache. Lint jobs run on separate 8-core xlarge machines, matching GitHub's distributed
-# runner model instead of contending inside one machine. Unit jobs are likewise split
-# across separate xlarge machines. Other workflows run up to four internal jobs.
-#
-# Excluded: pr-title.yml and label-pr.yml mutate PR metadata, while cyclops-audit.yml is a
-# privileged label/comment integration. book.yml remains included for its validation build;
-# its deployment job is skipped for pull_request and merge_group events.
+# Excluded: pr-title.yml, label-pr.yml, and the privileged cyclops-audit.yml integration.
 
 jobs:
   prepare-act-event:
