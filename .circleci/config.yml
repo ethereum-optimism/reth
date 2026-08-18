@@ -20,8 +20,8 @@ version: 2.1
 # cache. Lint jobs run on separate 8-core xlarge machines, matching GitHub's distributed
 # runner model instead of contending inside one machine. Unit jobs are likewise split
 # across separate xlarge machines to match upstream's distributed runners. A preflight
-# check fails if the static lint shard list drifts from lint.yml. Other workflows run up
-# to four internal jobs.
+# check fails if the static lint or unit shard lists drift from their workflows. Other
+# workflows run up to four internal jobs.
 #
 # Excluded: pr-title.yml and label-pr.yml mutate PR metadata, while cyclops-audit.yml is a
 # privileged label/comment integration. book.yml remains included for its validation build;
@@ -192,7 +192,7 @@ jobs:
               --local-repository "actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d=/tmp/noop-pages" \
               --local-repository "actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9=/tmp/noop-pages"
 
-  validate-lint-shards:
+  validate-act-shards:
     machine:
       image: ubuntu-2404:2025.09.1
     resource_class: medium
@@ -212,13 +212,13 @@ jobs:
             sudo install -m 0755 "/tmp/${YQ_BINARY}" /usr/local/bin/yq
             test "$(yq --version)" = "yq (https://github.com/mikefarah/yq/) version ${YQ_VERSION}"
       - run:
-          name: Validate lint shards
-          command: .circleci/check-lint-shards.sh
+          name: Validate act shards
+          command: .circleci/check-act-shards.sh
 
 workflows:
   reth-act-pull-request:
     jobs:
-      - validate-lint-shards:
+      - validate-act-shards:
           filters:
             branches:
               ignore: /gh-readonly-queue\/.*/
@@ -247,7 +247,7 @@ workflows:
             - circleci-repo-readonly-authenticated-github-token
           name: "act-lint-<< matrix.job >>"
           requires:
-            - validate-lint-shards
+            - validate-act-shards
           matrix:
             parameters:
               job: &lint_jobs
@@ -280,6 +280,8 @@ workflows:
           context:
             - circleci-repo-readonly-authenticated-github-token
           name: "act-unit-<< matrix.job >>"
+          requires:
+            - validate-act-shards
           matrix:
             parameters:
               job: &unit_jobs
@@ -292,8 +294,8 @@ workflows:
 
   reth-act-merge-queue:
     jobs:
-      - validate-lint-shards:
-          name: merge-validate-lint-shards
+      - validate-act-shards:
+          name: merge-validate-act-shards
           filters:
             branches:
               only: /gh-readonly-queue\/.*/
@@ -323,7 +325,7 @@ workflows:
             - circleci-repo-readonly-authenticated-github-token
           name: "merge-act-lint-<< matrix.job >>"
           requires:
-            - merge-validate-lint-shards
+            - merge-validate-act-shards
           matrix:
             parameters:
               job: *lint_jobs
@@ -338,6 +340,8 @@ workflows:
           context:
             - circleci-repo-readonly-authenticated-github-token
           name: "merge-act-unit-<< matrix.job >>"
+          requires:
+            - merge-validate-act-shards
           matrix:
             parameters:
               job: *unit_jobs
