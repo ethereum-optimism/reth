@@ -115,14 +115,14 @@ jobs:
           command: |
             set -euo pipefail
             readonly ACT_VERSION="0.2.89"
-            readonly ACT_RELEASE="v0.2.89-action-cache-fix.2"
-            readonly ACT_ARCHIVE="act_Linux_x86_64.tar.gz"
-            readonly ACT_SHA256="d89542468a1d75363df6c66adc5447b5c15943a85b3fe2d177ebd90968915017"
+            readonly ACT_RELEASE="v0.2.89-action-cache-fix.4"
+            readonly ACT_BINARY="act_Linux_x86_64"
+            readonly ACT_SHA256="28bfcf1502f59a834b14f2fb23c39e5b253c2234d875592b5aa0a175f9674dce"
             curl --fail --silent --show-error --location \
-              "https://github.com/ethereum-optimism/act/releases/download/${ACT_RELEASE}/${ACT_ARCHIVE}" \
-              --output "/tmp/${ACT_ARCHIVE}"
-            echo "${ACT_SHA256}  /tmp/${ACT_ARCHIVE}" | sha256sum --check
-            sudo tar --extract --gzip --file "/tmp/${ACT_ARCHIVE}" --directory /usr/local/bin act
+              "https://github.com/ethereum-optimism/act/releases/download/${ACT_RELEASE}/${ACT_BINARY}" \
+              --output "/tmp/${ACT_BINARY}"
+            echo "${ACT_SHA256}  /tmp/${ACT_BINARY}" | sha256sum --check
+            sudo install -m 0755 "/tmp/${ACT_BINARY}" /usr/local/bin/act
             test "$(act --version)" = "act version ${ACT_VERSION}"
       - run:
           name: Stub unsupported non-check actions
