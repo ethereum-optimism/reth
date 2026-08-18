@@ -16,10 +16,11 @@ version: 2.1
 # compiler cache, not a check, and its GHA cache backend doesn't exist under act. Pages
 # setup/artifact actions are also no-ops after book.yml completes its validation build.
 #
-# act v0.2.89 has a race when parallel jobs populate its shared GoGit action cache. Keep
-# internal jobs sequential until act synchronizes cache reads/writes or we carry that patch.
-# unit.yml uses an xlarge machine because its EF/EEST state tests need the same 8-core class
-# as the upstream workflow and exceed the large machine's memory/time budget without sccache.
+# The pinned ethereum-optimism/act build synchronizes access to its shared GoGit action
+# cache. Internal jobs are capped at two so workflows gain parallelism without
+# oversubscribing CircleCI machines. unit.yml uses an xlarge machine because its EF/EEST
+# state tests need the same 8-core class as upstream and exceed the large machine's
+# memory/time budget without sccache.
 #
 # Excluded: pr-title.yml and label-pr.yml mutate PR metadata, while cyclops-audit.yml is a
 # privileged label/comment integration. book.yml remains included for its validation build;
@@ -114,10 +115,11 @@ jobs:
           command: |
             set -euo pipefail
             readonly ACT_VERSION="0.2.89"
+            readonly ACT_RELEASE="v0.2.89-action-cache-fix.1"
             readonly ACT_ARCHIVE="act_Linux_x86_64.tar.gz"
-            readonly ACT_SHA256="0191d6f1f3b716b5c55820032605d05fc3c1cdbf581ebeff655019e5dd1524c0"
+            readonly ACT_SHA256="4d1093f87290cd8ed54609dd352477af75e1d95d02cdec9805d4ec2a55da3cca"
             curl --fail --silent --show-error --location \
-              "https://github.com/nektos/act/releases/download/v${ACT_VERSION}/${ACT_ARCHIVE}" \
+              "https://github.com/ethereum-optimism/act/releases/download/${ACT_RELEASE}/${ACT_ARCHIVE}" \
               --output "/tmp/${ACT_ARCHIVE}"
             echo "${ACT_SHA256}  /tmp/${ACT_ARCHIVE}" | sha256sum --check
             sudo tar --extract --gzip --file "/tmp/${ACT_ARCHIVE}" --directory /usr/local/bin act
@@ -162,7 +164,7 @@ jobs:
             act "$event_name" -W ".github/workflows/<< parameters.wf >>" \
               --eventpath /tmp/github-event.json \
               -P "ubuntu-latest=catthehacker/ubuntu@sha256:b839c14c4410998529ec18f951262bdf87a2b23bc1467304d07b491b9455e074" \
-              --concurrent-jobs 1 \
+              --concurrent-jobs 2 \
               "${act_env[@]}" \
               -s GITHUB_TOKEN="${MISE_GITHUB_TOKEN:?missing restricted read-only GitHub token}" \
               --local-repository "mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696=/tmp/noop-sccache" \
