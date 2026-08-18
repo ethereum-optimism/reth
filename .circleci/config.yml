@@ -12,9 +12,9 @@ version: 2.1
 # act receives an event payload for the current trigger so workflow expressions (especially
 # base_ref) match GitHub Actions. act, its archive checksum, and the runner image are pinned.
 #
-# sccache stays disabled (remap sccache-action -> no-op + unset RUSTC_WRAPPER); it's a
-# compiler cache, not a check, and its GHA cache backend doesn't exist under act. Pages
-# setup/artifact actions are also no-ops after book.yml completes its validation build.
+# sccache and rust-cache stay disabled (remapped to no-ops + unset RUSTC_WRAPPER); they
+# are compiler caches, not checks, and their GHA cache backend is ephemeral under act.
+# Pages setup/artifact actions are also no-ops after book.yml completes its validation build.
 #
 # The pinned ethereum-optimism/act build synchronizes access to its shared GoGit action
 # cache. Lint jobs run on separate 8-core xlarge machines, matching GitHub's distributed
@@ -65,6 +65,7 @@ jobs:
                 api_url="https://api.github.com/repos/${repository}/pulls/${pr_number}"
                 curl --fail --silent --show-error --location \
                   -H "Accept: application/vnd.github+json" \
+                  -H "Authorization: Bearer ${MISE_GITHUB_TOKEN:?missing restricted read-only GitHub token}" \
                   -H "X-GitHub-Api-Version: 2022-11-28" \
                   "$api_url" > /tmp/pull-request.json
                 jq --arg head_sha "$CIRCLE_SHA1" '
@@ -134,7 +135,7 @@ jobs:
       - run:
           name: Stub unsupported non-check actions
           command: |
-            mkdir -p /tmp/noop-sccache /tmp/noop-pages
+            mkdir -p /tmp/noop-sccache /tmp/noop-rust-cache /tmp/noop-pages
             {
               echo 'name: noop-sccache'
               echo 'description: disabled sccache (act stub)'
@@ -144,6 +145,20 @@ jobs:
               echo '    - run: echo "sccache disabled (act stub)"'
               echo '      shell: bash'
             } > /tmp/noop-sccache/action.yml
+            {
+              echo 'name: noop-rust-cache'
+              echo 'description: disabled ephemeral rust-cache (act stub)'
+              echo 'inputs:'
+              echo '  cache-on-failure:'
+              echo '    required: false'
+              echo '  cache-targets:'
+              echo '    required: false'
+              echo 'runs:'
+              echo '  using: composite'
+              echo '  steps:'
+              echo '    - run: echo "rust-cache disabled (act stub)"'
+              echo '      shell: bash'
+            } > /tmp/noop-rust-cache/action.yml
             {
               echo 'name: noop-pages'
               echo 'description: disabled Pages setup/artifact plumbing (act stub)'
@@ -189,6 +204,7 @@ jobs:
               "${act_env[@]}" \
               -s GITHUB_TOKEN="${MISE_GITHUB_TOKEN:?missing restricted read-only GitHub token}" \
               --local-repository "mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696=/tmp/noop-sccache" \
+              --local-repository "Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4=/tmp/noop-rust-cache" \
               --local-repository "actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d=/tmp/noop-pages" \
               --local-repository "actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9=/tmp/noop-pages"
 
