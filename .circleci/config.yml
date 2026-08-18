@@ -17,9 +17,10 @@ version: 2.1
 # setup/artifact actions are also no-ops after book.yml completes its validation build.
 #
 # The pinned ethereum-optimism/act build synchronizes access to its shared GoGit action
-# cache. Each workflow uses an 8-core xlarge machine and caps internal jobs at four to
-# limit memory and disk contention. The EF/EEST state tests also need this 8-core class;
-# they exceed a large machine's memory/time budget without sccache.
+# cache. Lint jobs run on separate 8-core xlarge machines, matching GitHub's distributed
+# runner model instead of contending inside one machine. Other workflows cap internal jobs
+# at four; unit jobs remain sequential because concurrent full-workspace builds exhaust the
+# machine while EF/EEST state tests are running.
 #
 # Excluded: pr-title.yml and label-pr.yml mutate PR metadata, while cyclops-audit.yml is a
 # privileged label/comment integration. book.yml remains included for its validation build;
@@ -37,6 +38,12 @@ jobs:
         type: enum
         enum: [large, xlarge]
         default: xlarge
+      job:
+        type: string
+        default: ""
+      concurrent_jobs:
+        type: integer
+        default: 4
     machine:
       image: ubuntu-2404:2025.09.1
     resource_class: << parameters.resource >>
@@ -152,6 +159,19 @@ jobs:
             set -euo pipefail
             event_name="<< parameters.event >>"
             base_ref="$(cat /tmp/act-base-ref)"
+            target_job="<< parameters.job >>"
+            act_job=()
+            if [ -n "$target_job" ]; then
+              case "$target_job" in
+                crate-checks-[123])
+                  act_job=(-j crate-checks --matrix "partition:${target_job##*-}")
+                  ;;
+                *)
+                  act_job=(-j "$target_job")
+                  ;;
+              esac
+            fi
+
             act_env=(--env "RUSTC_WRAPPER=" --env "GITHUB_BASE_REF=${base_ref}")
             if [ "$event_name" = "merge_group" ]; then
               act_env+=(
@@ -161,9 +181,10 @@ jobs:
             fi
 
             act "$event_name" -W ".github/workflows/<< parameters.wf >>" \
+              "${act_job[@]}" \
               --eventpath /tmp/github-event.json \
               -P "ubuntu-latest=catthehacker/ubuntu@sha256:b839c14c4410998529ec18f951262bdf87a2b23bc1467304d07b491b9455e074" \
-              --concurrent-jobs 4 \
+              --concurrent-jobs << parameters.concurrent_jobs >> \
               "${act_env[@]}" \
               -s GITHUB_TOKEN="${MISE_GITHUB_TOKEN:?missing restricted read-only GitHub token}" \
               --local-repository "mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696=/tmp/noop-sccache" \
@@ -187,7 +208,37 @@ workflows:
                 - grafana.yml
                 - integration.yml
                 - lint-actions.yml
-                - lint.yml
+          filters:
+            branches:
+              ignore: /gh-readonly-queue\/.*/
+      - act:
+          event: pull_request
+          wf: lint.yml
+          concurrent_jobs: 1
+          context:
+            - circleci-repo-readonly-authenticated-github-token
+          name: "act-lint-<< matrix.job >>"
+          matrix:
+            parameters:
+              job:
+                - clippy-binaries
+                - clippy
+                - wasm
+                - riscv
+                - crate-checks-1
+                - crate-checks-2
+                - crate-checks-3
+                - msrv
+                - docs
+                - fmt
+                - udeps
+                - book
+                - typos
+                - check-toml
+                - grafana
+                - no-test-deps
+                - feature-propagation
+                - deny
           filters:
             branches:
               ignore: /gh-readonly-queue\/.*/
@@ -195,6 +246,7 @@ workflows:
           event: pull_request
           wf: unit.yml
           resource: xlarge
+          concurrent_jobs: 1
           context:
             - circleci-repo-readonly-authenticated-github-token
           name: act-unit.yml
@@ -218,8 +270,38 @@ workflows:
                 - grafana.yml
                 - integration.yml
                 - lint-actions.yml
-                - lint.yml
                 - stage.yml
+          filters:
+            branches:
+              only: /gh-readonly-queue\/.*/
+      - act:
+          event: merge_group
+          wf: lint.yml
+          concurrent_jobs: 1
+          context:
+            - circleci-repo-readonly-authenticated-github-token
+          name: "merge-act-lint-<< matrix.job >>"
+          matrix:
+            parameters:
+              job:
+                - clippy-binaries
+                - clippy
+                - wasm
+                - riscv
+                - crate-checks-1
+                - crate-checks-2
+                - crate-checks-3
+                - msrv
+                - docs
+                - fmt
+                - udeps
+                - book
+                - typos
+                - check-toml
+                - grafana
+                - no-test-deps
+                - feature-propagation
+                - deny
           filters:
             branches:
               only: /gh-readonly-queue\/.*/
@@ -227,6 +309,7 @@ workflows:
           event: merge_group
           wf: unit.yml
           resource: xlarge
+          concurrent_jobs: 1
           context:
             - circleci-repo-readonly-authenticated-github-token
           name: merge-act-unit.yml
