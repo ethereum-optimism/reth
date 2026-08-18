@@ -18,8 +18,9 @@ version: 2.1
 #
 # The pinned ethereum-optimism/act build synchronizes access to its shared GoGit action
 # cache. Lint jobs run on separate 8-core xlarge machines, matching GitHub's distributed
-# runner model instead of contending inside one machine. Other workflows cap internal jobs
-# at four; unit jobs remain sequential because concurrent full-workspace builds exhaust the
+# runner model instead of contending inside one machine. A preflight check fails if this
+# static shard list drifts from lint.yml. Other workflows run up to four internal jobs;
+# unit jobs remain sequential because concurrent full-workspace builds exhaust the
 # machine while EF/EEST state tests are running.
 #
 # Excluded: pr-title.yml and label-pr.yml mutate PR metadata, while cyclops-audit.yml is a
@@ -191,9 +192,37 @@ jobs:
               --local-repository "actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d=/tmp/noop-pages" \
               --local-repository "actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9=/tmp/noop-pages"
 
+  validate-lint-shards:
+    machine:
+      image: ubuntu-2404:2025.09.1
+    resource_class: medium
+    steps:
+      - checkout
+      - run:
+          name: Install pinned act
+          command: |
+            set -euo pipefail
+            readonly ACT_VERSION="0.2.89-action-cache-fix.1"
+            readonly ACT_RELEASE="v0.2.89-action-cache-fix.4"
+            readonly ACT_BINARY="act_Linux_x86_64"
+            readonly ACT_SHA256="28bfcf1502f59a834b14f2fb23c39e5b253c2234d875592b5aa0a175f9674dce"
+            curl --fail --silent --show-error --location \
+              "https://github.com/ethereum-optimism/act/releases/download/${ACT_RELEASE}/${ACT_BINARY}" \
+              --output "/tmp/${ACT_BINARY}"
+            echo "${ACT_SHA256}  /tmp/${ACT_BINARY}" | sha256sum --check
+            sudo install -m 0755 "/tmp/${ACT_BINARY}" /usr/local/bin/act
+            test "$(act --version)" = "act version ${ACT_VERSION}"
+      - run:
+          name: Validate lint shards
+          command: .circleci/check-lint-shards.sh
+
 workflows:
   reth-act-pull-request:
     jobs:
+      - validate-lint-shards:
+          filters:
+            branches:
+              ignore: /gh-readonly-queue\/.*/
       - act:
           event: pull_request
           context:
@@ -218,9 +247,11 @@ workflows:
           context:
             - circleci-repo-readonly-authenticated-github-token
           name: "act-lint-<< matrix.job >>"
+          requires:
+            - validate-lint-shards
           matrix:
             parameters:
-              job:
+              job: &lint_jobs
                 - clippy-binaries
                 - clippy
                 - wasm
@@ -256,6 +287,11 @@ workflows:
 
   reth-act-merge-queue:
     jobs:
+      - validate-lint-shards:
+          name: merge-validate-lint-shards
+          filters:
+            branches:
+              only: /gh-readonly-queue\/.*/
       - act:
           event: merge_group
           context:
@@ -281,27 +317,11 @@ workflows:
           context:
             - circleci-repo-readonly-authenticated-github-token
           name: "merge-act-lint-<< matrix.job >>"
+          requires:
+            - merge-validate-lint-shards
           matrix:
             parameters:
-              job:
-                - clippy-binaries
-                - clippy
-                - wasm
-                - riscv
-                - crate-checks-1
-                - crate-checks-2
-                - crate-checks-3
-                - msrv
-                - docs
-                - fmt
-                - udeps
-                - book
-                - typos
-                - check-toml
-                - grafana
-                - no-test-deps
-                - feature-propagation
-                - deny
+              job: *lint_jobs
           filters:
             branches:
               only: /gh-readonly-queue\/.*/
