@@ -114,7 +114,7 @@ jobs:
           name: Install pinned act
           command: |
             set -euo pipefail
-            readonly ACT_VERSION="0.2.89"
+            readonly ACT_VERSION="0.2.89-action-cache-fix.1"
             readonly ACT_RELEASE="v0.2.89-action-cache-fix.4"
             readonly ACT_BINARY="act_Linux_x86_64"
             readonly ACT_SHA256="28bfcf1502f59a834b14f2fb23c39e5b253c2234d875592b5aa0a175f9674dce"
