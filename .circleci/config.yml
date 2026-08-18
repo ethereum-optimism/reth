@@ -10,8 +10,10 @@ version: 2.1
 # these jobs. CircleCI's "Auto-cancel redundant workflows" project setting must be enabled
 # so superseded PR revisions stop consuming machines.
 #
-# act receives an event payload for the current trigger so workflow expressions (especially
-# base_ref) match GitHub Actions. act, its archive checksum, and the runner image are pinned.
+# A single preflight job snapshots the event for the exact CircleCI revision and distributes
+# it to every act shard. PR heads must still equal CIRCLE_SHA1; superseded pipelines stop
+# before installing tools. Merge-group base data comes from the queue commit's first parent.
+# act, its archive checksum, and the runner image are pinned.
 #
 # sccache and rust-cache stay disabled (remapped to no-ops + unset RUSTC_WRAPPER); they
 # are compiler caches, not checks, and their GHA cache backend is ephemeral under act.
@@ -29,6 +31,25 @@ version: 2.1
 # its deployment job is skipped for pull_request and merge_group events.
 
 jobs:
+  prepare-act-event:
+    machine:
+      image: ubuntu-2404:2025.09.1
+    resource_class: medium
+    steps:
+      - checkout
+      - run:
+          name: Snapshot GitHub event
+          command: |
+            mkdir -p /tmp/act-event
+            if ! .circleci/prepare-act-event.sh; then
+              echo "GitHub event preparation failed; act shards will report the failure" |
+                tee /tmp/act-event/failed
+            fi
+      - persist_to_workspace:
+          root: /tmp/act-event
+          paths:
+            - .
+
   act:
     parameters:
       wf:
@@ -48,79 +69,18 @@ jobs:
     resource_class: << parameters.resource >>
     steps:
       - checkout
+      - attach_workspace:
+          at: /tmp/act-event
       - run:
-          name: Prepare GitHub event
+          name: Check event snapshot
           command: |
-            set -euo pipefail
-            : "${CIRCLE_SHA1:?missing CircleCI revision}"
-            if [[ "${CIRCLE_BRANCH:-}" == gh-readonly-queue/* ]]; then
-              event_name="merge_group"
-            else
-              event_name="pull_request"
+            if [ -f /tmp/act-event/failed ]; then
+              cat /tmp/act-event/failed >&2
+              exit 1
+            elif [ -f /tmp/act-event/superseded ]; then
+              cat /tmp/act-event/superseded
+              circleci-agent step halt
             fi
-            repository="${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}"
-
-            case "$event_name" in
-              pull_request)
-                : "${CIRCLE_PULL_REQUEST:?pull-request trigger must provide CIRCLE_PULL_REQUEST}"
-                pr_number="${CIRCLE_PULL_REQUEST##*/}"
-                api_url="https://api.github.com/repos/${repository}/pulls/${pr_number}"
-                curl --fail --silent --show-error --location \
-                  -H "Accept: application/vnd.github+json" \
-                  -H "Authorization: Bearer ${MISE_GITHUB_TOKEN:?missing restricted read-only GitHub token}" \
-                  -H "X-GitHub-Api-Version: 2022-11-28" \
-                  "$api_url" > /tmp/pull-request.json
-                jq --arg head_sha "$CIRCLE_SHA1" '
-                  .head.sha = $head_sha |
-                  {
-                    action: "synchronize",
-                    number: .number,
-                    pull_request: .,
-                    repository: .base.repo,
-                    sender: .user
-                  }
-                ' /tmp/pull-request.json > /tmp/github-event.json
-                head_ref="$(jq -r '.pull_request.head.ref' /tmp/github-event.json)"
-                base_ref="$(jq -r '.pull_request.base.ref' /tmp/github-event.json)"
-                echo "act event: pull_request #${pr_number}, ${head_ref} -> ${base_ref}"
-                ;;
-              merge_group)
-                : "${CIRCLE_BRANCH:?merge-queue trigger must provide CIRCLE_BRANCH}"
-                if [[ ! "$CIRCLE_BRANCH" =~ ^gh-readonly-queue/([^/]+)/ ]]; then
-                  echo "merge_group requires a gh-readonly-queue branch, got: ${CIRCLE_BRANCH}" >&2
-                  exit 1
-                fi
-                base_ref="${BASH_REMATCH[1]}"
-                base_sha="$(git ls-remote origin "refs/heads/${base_ref}" | awk 'NR == 1 {print $1}')"
-                : "${base_sha:?unable to resolve merge-queue base SHA}"
-                jq -n \
-                  --arg head_sha "$CIRCLE_SHA1" \
-                  --arg head_ref "refs/heads/${CIRCLE_BRANCH}" \
-                  --arg base_sha "$base_sha" \
-                  --arg base_ref "refs/heads/${base_ref}" \
-                  --arg repository "$repository" \
-                  --arg repository_name "$CIRCLE_PROJECT_REPONAME" \
-                  --arg repository_owner "$CIRCLE_PROJECT_USERNAME" \
-                  '{
-                    action: "checks_requested",
-                    merge_group: {
-                      head_sha: $head_sha,
-                      head_ref: $head_ref,
-                      base_sha: $base_sha,
-                      base_ref: $base_ref
-                    },
-                    repository: {
-                      full_name: $repository,
-                      name: $repository_name,
-                      owner: {login: $repository_owner}
-                    }
-                  }' > /tmp/github-event.json
-                echo "act event: merge_group ${CIRCLE_BRANCH} -> ${base_ref}"
-                ;;
-            esac
-
-            printf '%s' "$base_ref" > /tmp/act-base-ref
-            printf '%s' "$event_name" > /tmp/act-event-name
       - run:
           name: Install pinned act
           command: |
@@ -176,8 +136,8 @@ jobs:
           no_output_timeout: 45m
           command: |
             set -euo pipefail
-            event_name="$(cat /tmp/act-event-name)"
-            base_ref="$(cat /tmp/act-base-ref)"
+            event_name="$(cat /tmp/act-event/event-name)"
+            base_ref="$(cat /tmp/act-event/base-ref)"
             target_job="<< parameters.job >>"
             act_job=()
             if [ -n "$target_job" ]; then
@@ -206,7 +166,7 @@ jobs:
 
             act "$event_name" -W ".github/workflows/<< parameters.wf >>" \
               "${act_job[@]}" \
-              --eventpath /tmp/github-event.json \
+              --eventpath /tmp/act-event/github-event.json \
               -P "ubuntu-latest=catthehacker/ubuntu@sha256:b839c14c4410998529ec18f951262bdf87a2b23bc1467304d07b491b9455e074" \
               --concurrent-jobs << parameters.concurrent_jobs >> \
               "${act_env[@]}" \
@@ -238,15 +198,23 @@ jobs:
       - run:
           name: Validate act shards
           command: .circleci/check-act-shards.sh
+      - run:
+          name: Test act event preparation
+          command: .circleci/test-prepare-act-event.sh
 
 workflows:
   reth-act:
     jobs:
+      - prepare-act-event:
+          context:
+            - circleci-repo-readonly-authenticated-github-token
       - validate-act-shards
       - act:
           context:
             - circleci-repo-readonly-authenticated-github-token
           name: "act-<< matrix.wf >>"
+          requires:
+            - prepare-act-event
           matrix:
             parameters:
               wf:
@@ -264,6 +232,7 @@ workflows:
             - circleci-repo-readonly-authenticated-github-token
           name: "act-lint-<< matrix.job >>"
           requires:
+            - prepare-act-event
             - validate-act-shards
           matrix:
             parameters:
@@ -294,6 +263,7 @@ workflows:
             - circleci-repo-readonly-authenticated-github-token
           name: "act-unit-<< matrix.job >>"
           requires:
+            - prepare-act-event
             - validate-act-shards
           matrix:
             parameters:

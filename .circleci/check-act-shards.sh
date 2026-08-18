@@ -71,4 +71,14 @@ if ! diff -u "$tmp_dir/unit-workflow-jobs" "$tmp_dir/unit-jobs"; then
   exit 1
 fi
 
+if ! yq -e '
+  [.workflows.reth-act.jobs[] |
+    select(has("act")) | .act |
+    select(((.requires // []) | contains(["prepare-act-event"])) == false)] |
+  length == 0
+' "$config_file" > /dev/null; then
+  echo "Every act invocation must require the shared prepare-act-event job" >&2
+  exit 1
+fi
+
 echo "CircleCI shards match $lint_workflow and $unit_workflow"

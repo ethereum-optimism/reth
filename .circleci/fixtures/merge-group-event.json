@@ -1,0 +1,16 @@
+{
+  "action": "checks_requested",
+  "merge_group": {
+    "head_sha": "3333333333333333333333333333333333333333",
+    "head_ref": "refs/heads/gh-readonly-queue/release/v1/pr-42-deadbeef",
+    "base_sha": "2222222222222222222222222222222222222222",
+    "base_ref": "refs/heads/release/v1"
+  },
+  "repository": {
+    "full_name": "ethereum-optimism/reth",
+    "name": "reth",
+    "owner": {
+      "login": "ethereum-optimism"
+    }
+  }
+}
