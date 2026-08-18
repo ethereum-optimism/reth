@@ -157,6 +157,11 @@ jobs:
             fi
 
             act_env=(--env "RUSTC_WRAPPER=" --env "GITHUB_BASE_REF=${base_ref}")
+            if [ "<< parameters.wf >>" = "unit.yml" ] && [ "$target_job" = "state" ]; then
+              # EF tests use Rayon internally, so unrestricted nextest processes multiply
+              # runnable threads and starve valid_blocks past its upstream timeout.
+              act_env+=(--env "NEXTEST_TEST_THREADS=2")
+            fi
             if [ "$event_name" = "merge_group" ]; then
               act_env+=(
                 --env "GITHUB_REF=refs/heads/${CIRCLE_BRANCH}"
