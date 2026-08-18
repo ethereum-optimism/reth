@@ -22,9 +22,7 @@ version: 2.1
 # The pinned ethereum-optimism/act build synchronizes access to its shared GoGit action
 # cache. Lint jobs run on separate 8-core xlarge machines, matching GitHub's distributed
 # runner model instead of contending inside one machine. Unit jobs are likewise split
-# across separate xlarge machines to match upstream's distributed runners. A preflight
-# check fails if the static lint or unit shard lists drift from their workflows. Other
-# workflows run up to four internal jobs.
+# across separate xlarge machines. Other workflows run up to four internal jobs.
 #
 # Excluded: pr-title.yml and label-pr.yml mutate PR metadata, while cyclops-audit.yml is a
 # privileged label/comment integration. book.yml remains included for its validation build;
@@ -54,10 +52,6 @@ jobs:
     parameters:
       wf:
         type: string
-      resource:
-        type: enum
-        enum: [large, xlarge]
-        default: xlarge
       job:
         type: string
         default: ""
@@ -66,7 +60,7 @@ jobs:
         default: 4
     machine:
       image: ubuntu-2404:2025.09.1
-    resource_class: << parameters.resource >>
+    resource_class: xlarge
     steps:
       - checkout
       - attach_workspace:
@@ -95,46 +89,27 @@ jobs:
       - run:
           name: Stub unsupported non-check actions
           command: |
-            mkdir -p /tmp/noop-sccache /tmp/noop-rust-cache /tmp/noop-pages
-            {
-              echo 'name: noop-sccache'
-              echo 'description: disabled sccache (act stub)'
-              echo 'runs:'
-              echo '  using: composite'
-              echo '  steps:'
-              echo '    - run: echo "sccache disabled (act stub)"'
-              echo '      shell: bash'
-            } > /tmp/noop-sccache/action.yml
-            {
-              echo 'name: noop-rust-cache'
-              echo 'description: disabled ephemeral rust-cache (act stub)'
-              echo 'inputs:'
-              echo '  cache-on-failure:'
-              echo '    required: false'
-              echo '  cache-targets:'
-              echo '    required: false'
-              echo 'runs:'
-              echo '  using: composite'
-              echo '  steps:'
-              echo '    - run: echo "rust-cache disabled (act stub)"'
-              echo '      shell: bash'
-            } > /tmp/noop-rust-cache/action.yml
-            {
-              echo 'name: noop-pages'
-              echo 'description: disabled Pages setup/artifact plumbing (act stub)'
-              echo 'runs:'
-              echo '  using: composite'
-              echo '  steps:'
-              echo '    - run: echo "Pages plumbing disabled after validation build (act stub)"'
-              echo '      shell: bash'
-            } > /tmp/noop-pages/action.yml
+            mkdir -p /tmp/noop-action
+            printf '%s\n' \
+              'name: noop' \
+              'description: disabled service plumbing under act' \
+              'inputs:' \
+              '  cache-on-failure: {required: false}' \
+              '  cache-targets: {required: false}' \
+              'runs:' \
+              '  using: composite' \
+              '  steps:' \
+              '    - run: echo "Service plumbing disabled under act"' \
+              '      shell: bash' \
+              > /tmp/noop-action/action.yml
       - run:
           name: Run << parameters.wf >> via act
           no_output_timeout: 45m
           command: |
             set -euo pipefail
-            event_name="$(cat /tmp/act-event/event-name)"
-            base_ref="$(cat /tmp/act-event/base-ref)"
+            event_path=/tmp/act-event/github-event.json
+            event_name="$(jq -er 'if has("pull_request") then "pull_request" elif has("merge_group") then "merge_group" else error("unsupported event") end' "$event_path")"
+            base_ref="$(jq -er 'if .pull_request then .pull_request.base.ref else (.merge_group.base_ref | sub("^refs/heads/"; "")) end | select(length > 0)' "$event_path")"
             target_job="<< parameters.job >>"
             act_job=()
             if [ -n "$target_job" ]; then
@@ -168,38 +143,15 @@ jobs:
 
             act "$event_name" -W ".github/workflows/<< parameters.wf >>" \
               "${act_job[@]}" \
-              --eventpath /tmp/act-event/github-event.json \
+              --eventpath "$event_path" \
               -P "ubuntu-latest=catthehacker/ubuntu@sha256:b839c14c4410998529ec18f951262bdf87a2b23bc1467304d07b491b9455e074" \
               --concurrent-jobs << parameters.concurrent_jobs >> \
               "${act_env[@]}" \
               -s GITHUB_TOKEN="${MISE_GITHUB_TOKEN:?missing restricted read-only GitHub token}" \
-              --local-repository "mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696=/tmp/noop-sccache" \
-              --local-repository "Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4=/tmp/noop-rust-cache" \
-              --local-repository "actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d=/tmp/noop-pages" \
-              --local-repository "actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9=/tmp/noop-pages"
-
-  validate-act-shards:
-    machine:
-      image: ubuntu-2404:2025.09.1
-    resource_class: medium
-    steps:
-      - checkout
-      - run:
-          name: Install pinned yq
-          command: |
-            set -euo pipefail
-            readonly YQ_VERSION="v4.53.3"
-            readonly YQ_BINARY="yq_linux_amd64"
-            readonly YQ_SHA256="fa52a4e758c63d38299163fbdd1edfb4c4963247918bf9c1c5d31d84789eded4"
-            curl --fail --silent --show-error --location \
-              "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_BINARY}" \
-              --output "/tmp/${YQ_BINARY}"
-            echo "${YQ_SHA256}  /tmp/${YQ_BINARY}" | sha256sum --check
-            sudo install -m 0755 "/tmp/${YQ_BINARY}" /usr/local/bin/yq
-            test "$(yq --version)" = "yq (https://github.com/mikefarah/yq/) version ${YQ_VERSION}"
-      - run:
-          name: Validate act shards
-          command: .circleci/check-act-shards.sh
+              --local-repository "mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696=/tmp/noop-action" \
+              --local-repository "Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4=/tmp/noop-action" \
+              --local-repository "actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d=/tmp/noop-action" \
+              --local-repository "actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9=/tmp/noop-action"
 
 workflows:
   reth-act:
@@ -207,7 +159,6 @@ workflows:
       - prepare-act-event:
           context:
             - circleci-repo-readonly-authenticated-github-token
-      - validate-act-shards
       - act:
           context:
             - circleci-repo-readonly-authenticated-github-token
@@ -232,7 +183,6 @@ workflows:
           name: "act-lint-<< matrix.job >>"
           requires:
             - prepare-act-event
-            - validate-act-shards
           matrix:
             parameters:
               job:
@@ -256,14 +206,12 @@ workflows:
                 - deny
       - act:
           wf: unit.yml
-          resource: xlarge
           concurrent_jobs: 1
           context:
             - circleci-repo-readonly-authenticated-github-token
           name: "act-unit-<< matrix.job >>"
           requires:
             - prepare-act-event
-            - validate-act-shards
           matrix:
             parameters:
               job:

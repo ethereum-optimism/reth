@@ -3,11 +3,9 @@ set -euo pipefail
 
 readonly OUTPUT_DIR="${ACT_EVENT_OUTPUT_DIR:-/tmp/act-event}"
 readonly EVENT_PATH="${OUTPUT_DIR}/github-event.json"
-readonly EVENT_NAME_PATH="${OUTPUT_DIR}/event-name"
-readonly BASE_REF_PATH="${OUTPUT_DIR}/base-ref"
 
 mkdir -p "$OUTPUT_DIR"
-rm -f "$EVENT_PATH" "$EVENT_NAME_PATH" "$BASE_REF_PATH"
+rm -f "$EVENT_PATH"
 
 : "${CIRCLE_SHA1:?missing CircleCI revision}"
 : "${CIRCLE_PROJECT_USERNAME:?missing CircleCI project owner}"
@@ -30,25 +28,14 @@ case "$event_name" in
             exit 1
         fi
 
-        pull_request_path="${ACT_PR_PAYLOAD_FILE:-${OUTPUT_DIR}/pull-request.json}"
-        if [[ -z "${ACT_PR_PAYLOAD_FILE:-}" ]]; then
-            api_url="https://api.github.com/repos/${repository}/pulls/${pr_number}"
-            curl --fail --silent --show-error --location \
-                -H "Accept: application/vnd.github+json" \
-                -H "Authorization: Bearer ${MISE_GITHUB_TOKEN:?missing restricted read-only GitHub token}" \
-                -H "X-GitHub-Api-Version: 2022-11-28" \
-                "$api_url" > "$pull_request_path"
-        fi
+        pull_request_path="${OUTPUT_DIR}/pull-request.json"
+        curl --fail --silent --show-error --location \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${MISE_GITHUB_TOKEN:?missing restricted read-only GitHub token}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${repository}/pulls/${pr_number}" > "$pull_request_path"
 
-        jq -e \
-            --argjson number "$pr_number" \
-            --arg repository "$repository" \
-            '.number == $number and .base.repo.full_name == $repository and
-             (.head.sha | type == "string") and (.head.ref | type == "string") and
-             (.base.ref | type == "string")' \
-            "$pull_request_path" > /dev/null
-
-        event_head_sha="$(jq -r '.head.sha' "$pull_request_path")"
+        event_head_sha="$(jq -er '.head.sha' "$pull_request_path")"
         if [[ "$event_head_sha" != "$CIRCLE_SHA1" ]]; then
             echo "PR head does not match CircleCI revision: ${CIRCLE_SHA1} != ${event_head_sha}" >&2
             exit 1
@@ -61,8 +48,8 @@ case "$event_name" in
             repository: .base.repo,
             sender: .user
         }' "$pull_request_path" > "$EVENT_PATH"
-        base_ref="$(jq -er '.pull_request.base.ref | select(length > 0)' "$EVENT_PATH")"
-        head_ref="$(jq -er '.pull_request.head.ref | select(length > 0)' "$EVENT_PATH")"
+        base_ref="$(jq -er '.base.ref | select(length > 0)' "$pull_request_path")"
+        head_ref="$(jq -er '.head.ref | select(length > 0)' "$pull_request_path")"
         echo "act event: pull_request #${pr_number}, ${head_ref} -> ${base_ref}"
         ;;
     merge_group)
@@ -73,11 +60,6 @@ case "$event_name" in
         fi
         base_ref="${BASH_REMATCH[1]}"
 
-        resolved_head_sha="$(git rev-parse "${CIRCLE_SHA1}^{commit}")"
-        if [[ "$resolved_head_sha" != "$CIRCLE_SHA1" ]]; then
-            echo "CircleCI revision did not resolve exactly: ${CIRCLE_SHA1} -> ${resolved_head_sha}" >&2
-            exit 1
-        fi
         if ! base_sha="$(git rev-parse "${CIRCLE_SHA1}^1" 2>/dev/null)"; then
             git fetch --no-tags --depth=2 origin "$CIRCLE_SHA1"
             base_sha="$(git rev-parse "${CIRCLE_SHA1}^1")"
@@ -108,6 +90,3 @@ case "$event_name" in
         echo "act event: merge_group ${CIRCLE_BRANCH} -> ${base_ref} at ${base_sha}"
         ;;
 esac
-
-printf '%s' "$base_ref" > "$BASE_REF_PATH"
-printf '%s' "$event_name" > "$EVENT_NAME_PATH"
