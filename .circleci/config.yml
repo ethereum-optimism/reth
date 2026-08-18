@@ -115,9 +115,9 @@ jobs:
           command: |
             set -euo pipefail
             readonly ACT_VERSION="0.2.89"
-            readonly ACT_RELEASE="v0.2.89-action-cache-fix.1"
+            readonly ACT_RELEASE="v0.2.89-action-cache-fix.2"
             readonly ACT_ARCHIVE="act_Linux_x86_64.tar.gz"
-            readonly ACT_SHA256="4d1093f87290cd8ed54609dd352477af75e1d95d02cdec9805d4ec2a55da3cca"
+            readonly ACT_SHA256="d89542468a1d75363df6c66adc5447b5c15943a85b3fe2d177ebd90968915017"
             curl --fail --silent --show-error --location \
               "https://github.com/ethereum-optimism/act/releases/download/${ACT_RELEASE}/${ACT_ARCHIVE}" \
               --output "/tmp/${ACT_ARCHIVE}"
