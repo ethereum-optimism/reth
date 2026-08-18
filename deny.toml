@@ -12,6 +12,12 @@ ignore = [
     "RUSTSEC-2023-0089",
     # https://rustsec.org/advisories/RUSTSEC-2026-0173 proc-macro-error2 is unmaintained
     "RUSTSEC-2026-0173",
+    # https://rustsec.org/advisories/RUSTSEC-2026-0247 bitmaps is unmaintained, transitive dep via imbl
+    "RUSTSEC-2026-0247",
+    # https://rustsec.org/advisories/RUSTSEC-2026-0258 h2 accepts unbounded empty DATA frames, fixed in 0.4.16
+    "RUSTSEC-2026-0258",
+    # https://rustsec.org/advisories/RUSTSEC-2026-0220 ruint has incorrect shift overflow behavior, fixed in 1.20.0
+    "RUSTSEC-2026-0220",
 ]
 
 # This section is considered when running `cargo deny check bans`.
