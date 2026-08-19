@@ -15,8 +15,10 @@ repository="${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}"
 
 if [[ "${CIRCLE_BRANCH:-}" == gh-readonly-queue/* ]]; then
     event_name="merge_group"
-else
+elif [[ -n "${CIRCLE_PULL_REQUEST:-}" ]]; then
     event_name="pull_request"
+else
+    event_name="push"
 fi
 
 case "$event_name" in
@@ -51,6 +53,14 @@ case "$event_name" in
         base_ref="$(jq -er '.base.ref | select(length > 0)' "$pull_request_path")"
         head_ref="$(jq -er '.head.ref | select(length > 0)' "$pull_request_path")"
         echo "act event: pull_request #${pr_number}, ${head_ref} -> ${base_ref}"
+        ;;
+    push)
+        : "${CIRCLE_BRANCH:?push trigger must provide CIRCLE_BRANCH}"
+        jq -n \
+            --arg ref "refs/heads/${CIRCLE_BRANCH}" \
+            --arg after "$CIRCLE_SHA1" \
+            '{ref: $ref, after: $after}' > "$EVENT_PATH"
+        echo "act event: push ${CIRCLE_BRANCH} at ${CIRCLE_SHA1}"
         ;;
     merge_group)
         : "${CIRCLE_BRANCH:?merge-queue trigger must provide CIRCLE_BRANCH}"

@@ -1,8 +1,8 @@
 version: 2.1
 
-# Runs this fork's PR validation workflows through pinned act because GitHub Actions is
-# disabled. Merge queues run the same checks plus stage.yml. Event metadata is generated once
-# per CircleCI revision and shared by all shards.
+# Runs this fork's validation workflows through pinned act because GitHub Actions is disabled.
+# Pull requests and branch pushes run the PR checks; merge queues add stage.yml. Event metadata is
+# generated once per CircleCI revision and shared by all shards.
 #
 # The read-only GitHub token is exposed to PR code, so its CircleCI context must remain
 # restricted to trusted contributors. Keep CircleCI auto-cancellation enabled.
@@ -93,8 +93,8 @@ jobs:
           command: |
             set -euo pipefail
             event_path=/tmp/act-event/github-event.json
-            event_name="$(jq -er 'if has("pull_request") then "pull_request" elif has("merge_group") then "merge_group" else error("unsupported event") end' "$event_path")"
-            base_ref="$(jq -er 'if .pull_request then .pull_request.base.ref else (.merge_group.base_ref | sub("^refs/heads/"; "")) end | select(length > 0)' "$event_path")"
+            event_name="$(jq -er 'if .pull_request then "pull_request" elif .merge_group then "merge_group" elif .ref and .after then "push" else error("unsupported event") end' "$event_path")"
+            base_ref="$(jq -r '(.pull_request.base.ref // .merge_group.base_ref // "") | sub("^refs/heads/"; "")' "$event_path")"
             target_job="<< parameters.job >>"
             act_job=()
             if [ -n "$target_job" ]; then
@@ -119,7 +119,7 @@ jobs:
               # runnable threads and starve valid_blocks past its upstream timeout.
               act_env+=(--env "NEXTEST_TEST_THREADS=2")
             fi
-            if [ "$event_name" = "merge_group" ]; then
+            if [ "$event_name" != "pull_request" ]; then
               act_env+=(
                 --env "GITHUB_REF=refs/heads/${CIRCLE_BRANCH}"
                 --env "GITHUB_SHA=${CIRCLE_SHA1}"
