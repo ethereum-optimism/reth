@@ -25,7 +25,7 @@ use reth_evm::{
     EvmEnvFor, HaltReasonFor, InspectorFor, TransactionEnvMut, TxEnvFor,
 };
 use reth_node_api::BlockBody;
-use reth_primitives_traits::Recovered;
+use reth_primitives_traits::{HeaderTy, Recovered, SealedHeader};
 use reth_revm::{
     cancelled::CancelOnDrop,
     database::StateProviderDatabase,
@@ -140,6 +140,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                         .next_evm_env(&parent, &attributes)
                         .map_err(RethError::other)
                         .map_err(Self::Error::from_eth_err)?;
+                    this.apply_simulation_evm_env_overrides(&parent, &mut evm_env)?;
 
                     // Always disable EIP-3607
                     evm_env.cfg_env.disable_eip3607 = true;
@@ -546,6 +547,18 @@ pub trait Call:
 
     /// Returns the maximum memory the EVM can allocate per RPC request.
     fn evm_memory_limit(&self) -> u64;
+
+    /// Applies chain-specific overrides to a simulated next-block EVM environment.
+    ///
+    /// This runs before request-level validation and block overrides are applied. The default is a
+    /// no-op so standard Ethereum simulation behavior is unchanged.
+    fn apply_simulation_evm_env_overrides(
+        &self,
+        _parent: &SealedHeader<HeaderTy<Self::Primitives>>,
+        _evm_env: &mut EvmEnvFor<Self::Evm>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
 
     /// Returns the max gas limit that the caller can afford given a transaction environment.
     fn caller_gas_allowance(
