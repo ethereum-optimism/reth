@@ -119,13 +119,48 @@ where
     .boxed()
 }
 
+/// Returns a spawnable transaction-pool maintenance future that uses a custom pending base fee.
+pub fn maintain_transaction_pool_future_with_base_fee<N, Client, P, St, BaseFee>(
+    client: Client,
+    pool: P,
+    events: St,
+    task_spawner: Runtime,
+    config: MaintainPoolConfig,
+    pending_base_fee: BaseFee,
+) -> BoxFuture<'static, ()>
+where
+    N: NodePrimitives,
+    Client: StateProviderFactory
+        + BlockReaderIdExt<Header = N::BlockHeader>
+        + ChainSpecProvider<ChainSpec: EthChainSpec<Header = N::BlockHeader> + EthereumHardforks>
+        + Clone
+        + 'static,
+    P: TransactionPoolExt<Transaction: PoolTransaction<Consensus = N::SignedTx>, Block = N::Block>
+        + 'static,
+    St: Stream<Item = CanonStateNotification<N>> + Send + Unpin + 'static,
+    BaseFee: Fn(&N::BlockHeader) -> u64 + Send + Sync + 'static,
+{
+    async move {
+        maintain_transaction_pool_with_base_fee(
+            client,
+            pool,
+            events,
+            task_spawner,
+            config,
+            pending_base_fee,
+        )
+        .await;
+    }
+    .boxed()
+}
+
 /// Maintains the state of the transaction pool by handling new blocks and reorgs.
 ///
-/// This listens for any new blocks and reorgs and updates the transaction pool's state accordingly
+/// This listens for any new blocks and reorgs and updates the transaction pool's state accordingly.
 pub async fn maintain_transaction_pool<N, Client, P, St>(
     client: Client,
     pool: P,
-    mut events: St,
+    events: St,
     task_spawner: Runtime,
     config: MaintainPoolConfig,
 ) where
@@ -139,6 +174,44 @@ pub async fn maintain_transaction_pool<N, Client, P, St>(
         + 'static,
     St: Stream<Item = CanonStateNotification<N>> + Send + Unpin + 'static,
 {
+    let chain_spec = client.chain_spec();
+    maintain_transaction_pool_with_base_fee(
+        client,
+        pool,
+        events,
+        task_spawner,
+        config,
+        move |header| {
+            chain_spec.next_block_base_fee(header, header.timestamp()).unwrap_or_default()
+        },
+    )
+    .await;
+}
+
+/// Maintains the transaction pool using a custom function to determine the pending base fee.
+///
+/// The function is invoked for the latest canonical header at startup and after every commit or
+/// reorg. This allows node implementations whose next-block fee is not derivable from the parent
+/// header to keep pool transaction classification aligned with block building.
+pub async fn maintain_transaction_pool_with_base_fee<N, Client, P, St, BaseFee>(
+    client: Client,
+    pool: P,
+    mut events: St,
+    task_spawner: Runtime,
+    config: MaintainPoolConfig,
+    pending_base_fee: BaseFee,
+) where
+    N: NodePrimitives,
+    Client: StateProviderFactory
+        + BlockReaderIdExt<Header = N::BlockHeader>
+        + ChainSpecProvider<ChainSpec: EthChainSpec<Header = N::BlockHeader> + EthereumHardforks>
+        + Clone
+        + 'static,
+    P: TransactionPoolExt<Transaction: PoolTransaction<Consensus = N::SignedTx>, Block = N::Block>
+        + 'static,
+    St: Stream<Item = CanonStateNotification<N>> + Send + Unpin + 'static,
+    BaseFee: Fn(&N::BlockHeader) -> u64 + Send + Sync + 'static,
+{
     let metrics = MaintainPoolMetrics::default();
     let MaintainPoolConfig { max_update_depth, max_reload_accounts, .. } = config;
     // ensure the pool points to latest state
@@ -149,9 +222,7 @@ pub async fn maintain_transaction_pool<N, Client, P, St>(
             block_gas_limit: latest.gas_limit(),
             last_seen_block_hash: latest.hash(),
             last_seen_block_number: latest.number(),
-            pending_basefee: chain_spec
-                .next_block_base_fee(latest.header(), latest.timestamp())
-                .unwrap_or_default(),
+            pending_basefee: pending_base_fee(latest.header()),
             pending_blob_fee: latest
                 .maybe_next_block_blob_fee(chain_spec.blob_params_at_timestamp(latest.timestamp())),
         };
@@ -336,9 +407,7 @@ pub async fn maintain_transaction_pool<N, Client, P, St>(
                 let chain_spec = client.chain_spec();
 
                 // fees for the next block: `new_tip+1`
-                let pending_block_base_fee = chain_spec
-                    .next_block_base_fee(new_tip.header(), new_tip.timestamp())
-                    .unwrap_or_default();
+                let pending_block_base_fee = pending_base_fee(new_tip.header());
                 let pending_block_blob_fee = new_tip.header().maybe_next_block_blob_fee(
                     chain_spec.blob_params_at_timestamp(new_tip.timestamp()),
                 );
@@ -442,9 +511,7 @@ pub async fn maintain_transaction_pool<N, Client, P, St>(
                 let chain_spec = client.chain_spec();
 
                 // fees for the next block: `tip+1`
-                let pending_block_base_fee = chain_spec
-                    .next_block_base_fee(tip.header(), tip.timestamp())
-                    .unwrap_or_default();
+                let pending_block_base_fee = pending_base_fee(tip.header());
                 let pending_block_blob_fee = tip.header().maybe_next_block_blob_fee(
                     chain_spec.blob_params_at_timestamp(tip.timestamp()),
                 );
@@ -861,7 +928,7 @@ mod tests {
     };
     use alloy_eips::eip2718::Decodable2718;
     use alloy_primitives::{hex, U256};
-    use reth_ethereum_primitives::PooledTransactionVariant;
+    use reth_ethereum_primitives::{EthPrimitives, PooledTransactionVariant};
     use reth_evm_ethereum::EthEvmConfig;
     use reth_fs_util as fs;
     use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
@@ -923,6 +990,30 @@ mod tests {
         assert_eq!(txs.len(), 1);
 
         temp_dir.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn custom_pending_base_fee_initializes_pool_block_info() {
+        let provider = MockEthProvider::default().with_genesis_block();
+        let blob_store = InMemoryBlobStore::default();
+        let validator =
+            EthTransactionValidatorBuilder::new(provider.clone(), EthEvmConfig::mainnet())
+                .build::<EthPooledTransaction, _>(blob_store.clone());
+        let pool =
+            Pool::new(validator, CoinbaseTipOrdering::default(), blob_store, Default::default());
+        let events = futures_util::stream::empty::<CanonStateNotification<EthPrimitives>>();
+
+        maintain_transaction_pool_with_base_fee::<EthPrimitives, _, _, _, _>(
+            provider,
+            pool.clone(),
+            events,
+            Runtime::test(),
+            MaintainPoolConfig::default(),
+            |_| 777,
+        )
+        .await;
+
+        assert_eq!(pool.block_info().pending_basefee, 777);
     }
 
     #[test]

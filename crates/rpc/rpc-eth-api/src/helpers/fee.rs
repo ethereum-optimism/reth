@@ -113,15 +113,14 @@ pub trait EthFees:
                 newest_block = BlockNumberOrTag::Latest;
             }
 
-            // For explicit block numbers, validate against chain head before resolution
-            if let BlockNumberOrTag::Number(requested) = newest_block {
-                let latest_block =
-                    self.provider().best_block_number().map_err(Self::Error::from_eth_err)?;
-                if requested > latest_block {
-                    return Err(
-                        EthApiError::RequestBeyondHead { requested, head: latest_block }.into()
-                    )
-                }
+            let latest_block =
+                self.provider().best_block_number().map_err(Self::Error::from_eth_err)?;
+
+            // For explicit block numbers, validate against chain head before resolution.
+            if let BlockNumberOrTag::Number(requested) = newest_block &&
+                requested > latest_block
+            {
+                return Err(EthApiError::RequestBeyondHead { requested, head: latest_block }.into())
             }
 
             let end_block = self
@@ -184,13 +183,18 @@ pub trait EthFees:
                 let last_entry = fee_entries.last().expect("is not empty");
 
                 // Also need to include the `base_fee_per_gas` and `base_fee_per_blob_gas` for the
-                // next block
-                base_fee_per_gas.push(
+                // next block. For a historical range the child is already canonical, and a custom
+                // pending-fee provider is not necessarily able to reproduce its selected fee.
+                let next_base_fee = if end_block < latest_block {
                     self.provider()
-                        .chain_spec()
-                        .next_block_base_fee(&last_entry.header, last_entry.header.timestamp())
-                        .unwrap_or_default() as u128,
-                );
+                        .header_by_number(end_block_plus)
+                        .map_err(Self::Error::from_eth_err)?
+                        .ok_or(EthApiError::HeaderNotFound(end_block_plus.into()))?
+                        .base_fee_per_gas()
+                } else {
+                    self.pending_base_fee(&last_entry.header)?
+                };
+                base_fee_per_gas.push(next_base_fee.unwrap_or_default() as u128);
 
                 base_fee_per_blob_gas.push(last_entry.next_block_blob_fee().unwrap_or_default());
             } else {
@@ -244,16 +248,21 @@ pub trait EthFees:
                 }
 
                 // The spec states that `base_fee_per_gas` "[..] includes the next block after the
-                // newest of the returned range, because this value can be derived from the
-                // newest block"
+                // newest of the returned range". Use the canonical child for historical ranges;
+                // only the current tip needs a provisional pending-fee quote.
                 //
                 // The unwrap is safe since we checked earlier that we got at least 1 header.
                 let last_header = headers.last().expect("is present");
-                base_fee_per_gas.push(
-                    chain_spec
-                        .next_block_base_fee(last_header.header(), last_header.timestamp())
-                        .unwrap_or_default() as u128,
-                );
+                let next_base_fee = if end_block < latest_block {
+                    self.provider()
+                        .header_by_number(end_block_plus)
+                        .map_err(Self::Error::from_eth_err)?
+                        .ok_or(EthApiError::HeaderNotFound(end_block_plus.into()))?
+                        .base_fee_per_gas()
+                } else {
+                    self.pending_base_fee(last_header.header())?
+                };
+                base_fee_per_gas.push(next_base_fee.unwrap_or_default() as u128);
                 // Same goes for the `base_fee_per_blob_gas`:
                 // > "[..] includes the next block after the newest of the returned range, because this value can be derived from the newest block.
                 base_fee_per_blob_gas.push(
@@ -311,6 +320,29 @@ where
     /// Data access in default (L1) trait method implementations.
     fn fee_history_cache(&self) -> &FeeHistoryCache<ProviderHeader<Self::Provider>>;
 
+    /// Returns the base fee expected for the block after `header`.
+    ///
+    /// Node implementations whose pending fee is not derivable from the parent header can
+    /// override this to keep transaction filling and fee RPCs aligned with block building.
+    fn pending_base_fee(
+        &self,
+        header: &ProviderHeader<Self::Provider>,
+    ) -> Result<Option<u64>, Self::Error> {
+        Ok(self.provider().chain_spec().next_block_base_fee(header, header.timestamp()))
+    }
+
+    /// Returns the base fee used to fill an `eth_fillTransaction` response.
+    ///
+    /// The default preserves geth-compatible behavior by using the latest header's fee. Chains
+    /// with a producer-selected pending fee can override this without changing the default for
+    /// other node implementations.
+    fn fill_transaction_base_fee(
+        &self,
+        header: &ProviderHeader<Self::Provider>,
+    ) -> Result<Option<u64>, Self::Error> {
+        Ok(header.base_fee_per_gas())
+    }
+
     /// Returns the gas price if it is set, otherwise fetches a suggested gas price for legacy
     /// transactions.
     fn legacy_gas_price(
@@ -347,11 +379,8 @@ where
                         .latest_header()
                         .map_err(Self::Error::from_eth_err)?
                         .ok_or(EthApiError::HeaderNotFound(BlockNumberOrTag::Latest.into()))?;
-                    let pending_base_fee = self
-                        .provider()
-                        .chain_spec()
-                        .next_block_base_fee(&latest, latest.timestamp())
-                        .ok_or(EthApiError::InvalidTransaction(
+                    let pending_base_fee =
+                        self.pending_base_fee(&latest)?.ok_or(EthApiError::InvalidTransaction(
                             RpcInvalidTransactionError::TxTypeNotSupported,
                         ))?;
                     U256::from(pending_base_fee)
@@ -415,11 +444,7 @@ where
                 .latest_header()
                 .map_err(Self::Error::from_eth_err)?
                 .ok_or(EthApiError::HeaderNotFound(BlockNumberOrTag::Latest.into()))?;
-            Ok(self
-                .provider()
-                .chain_spec()
-                .next_block_base_fee(&header, header.timestamp())
-                .map(U256::from))
+            Ok(self.pending_base_fee(&header)?.map(U256::from))
         }
     }
 

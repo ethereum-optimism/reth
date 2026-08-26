@@ -4,7 +4,7 @@ use crate::{BuilderContext, FullNodeTypes};
 use alloy_primitives::map::AddressSet;
 use reth_chain_state::CanonStateSubscriptions;
 use reth_chainspec::EthereumHardforks;
-use reth_node_api::{BlockTy, NodeTypes, TxTy};
+use reth_node_api::{BlockTy, HeaderTy, NodeTypes, TxTy};
 use reth_transaction_pool::{
     blobstore::DiskFileBlobStore, BlobStore, CoinbaseTipOrdering, PoolConfig, PoolTransaction,
     SubPoolLimit, TransactionOrdering, TransactionPool, TransactionValidationTaskExecutor,
@@ -285,15 +285,52 @@ where
             pool,
             chain_events,
             ctx.task_executor().clone(),
-            reth_transaction_pool::maintain::MaintainPoolConfig {
-                max_tx_lifetime: pool_config.max_queued_lifetime,
-                no_local_exemptions: pool_config.local_transactions_config.no_exemptions,
-                ..Default::default()
-            },
+            maintain_pool_config(pool_config),
         ),
     );
 
     Ok(())
+}
+
+/// Spawn the main transaction-pool maintenance task with a custom pending base fee function.
+fn spawn_pool_maintenance_task_with_base_fee<Node, Pool, BaseFee>(
+    ctx: &BuilderContext<Node>,
+    pool: Pool,
+    pool_config: &PoolConfig,
+    pending_base_fee: BaseFee,
+) -> eyre::Result<()>
+where
+    Node: FullNodeTypes<Types: NodeTypes<ChainSpec: EthereumHardforks>>,
+    Pool: reth_transaction_pool::TransactionPoolExt<Block = BlockTy<Node::Types>> + Clone + 'static,
+    Pool::Transaction: PoolTransaction<Consensus = TxTy<Node::Types>>,
+    BaseFee: Fn(&HeaderTy<Node::Types>) -> u64 + Send + Sync + 'static,
+{
+    let chain_events = ctx.provider().canonical_state_stream();
+    let client = ctx.provider().clone();
+
+    ctx.task_executor().spawn_critical_task(
+        "txpool maintenance task",
+        reth_transaction_pool::maintain::maintain_transaction_pool_future_with_base_fee(
+            client,
+            pool,
+            chain_events,
+            ctx.task_executor().clone(),
+            maintain_pool_config(pool_config),
+            pending_base_fee,
+        ),
+    );
+
+    Ok(())
+}
+
+fn maintain_pool_config(
+    pool_config: &PoolConfig,
+) -> reth_transaction_pool::maintain::MaintainPoolConfig {
+    reth_transaction_pool::maintain::MaintainPoolConfig {
+        max_tx_lifetime: pool_config.max_queued_lifetime,
+        no_local_exemptions: pool_config.local_transactions_config.no_exemptions,
+        ..Default::default()
+    }
 }
 
 /// Spawn all maintenance tasks for a transaction pool (backup + main maintenance).
@@ -309,6 +346,24 @@ where
 {
     spawn_local_backup_task(ctx, pool.clone())?;
     spawn_pool_maintenance_task(ctx, pool, pool_config)?;
+    Ok(())
+}
+
+/// Spawn all transaction-pool maintenance tasks with a custom pending base fee function.
+pub fn spawn_maintenance_tasks_with_base_fee<Node, Pool, BaseFee>(
+    ctx: &BuilderContext<Node>,
+    pool: Pool,
+    pool_config: &PoolConfig,
+    pending_base_fee: BaseFee,
+) -> eyre::Result<()>
+where
+    Node: FullNodeTypes<Types: NodeTypes<ChainSpec: EthereumHardforks>>,
+    Pool: reth_transaction_pool::TransactionPoolExt<Block = BlockTy<Node::Types>> + Clone + 'static,
+    Pool::Transaction: PoolTransaction<Consensus = TxTy<Node::Types>>,
+    BaseFee: Fn(&HeaderTy<Node::Types>) -> u64 + Send + Sync + 'static,
+{
+    spawn_local_backup_task(ctx, pool.clone())?;
+    spawn_pool_maintenance_task_with_base_fee(ctx, pool, pool_config, pending_base_fee)?;
     Ok(())
 }
 

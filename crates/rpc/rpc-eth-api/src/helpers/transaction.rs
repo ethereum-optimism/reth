@@ -588,7 +588,12 @@ pub trait EthTransactions: LoadTransaction<Provider: BlockReaderIdExt> {
                 if request.as_ref().max_fee_per_gas().is_none() {
                     let header =
                         self.provider().latest_header().map_err(Self::Error::from_eth_err)?;
-                    let base_fee = header.and_then(|h| h.base_fee_per_gas()).unwrap_or_default();
+                    let base_fee = match header {
+                        Some(header) => {
+                            self.fill_transaction_base_fee(&header)?.unwrap_or_default()
+                        }
+                        None => 0,
+                    };
                     // Use `2 * base_fee` as headroom, matching go-ethereum's
                     // `setLondonFeeDefaults`, so the transaction does not
                     // become invalid if the base fee rises before it is
