@@ -25,7 +25,7 @@ use reth_evm::{
     EvmEnvFor, HaltReasonFor, InspectorFor, TransactionEnvMut, TxEnvFor,
 };
 use reth_node_api::BlockBody;
-use reth_primitives_traits::Recovered;
+use reth_primitives_traits::{HeaderTy, Recovered, SealedHeader};
 use reth_revm::{
     cancelled::CancelOnDrop,
     database::StateProviderDatabase,
@@ -129,6 +129,9 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
 
                 for block in block_state_calls {
                     let SimBlock { block_overrides, state_overrides, calls } = block;
+                    let has_base_fee_override = block_overrides
+                        .as_ref()
+                        .is_some_and(|overrides| overrides.base_fee.is_some());
 
                     let attributes = this
                         .pending_env_builder()
@@ -177,6 +180,12 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                             &mut db,
                             evm_env.block_env.inner_mut(),
                         );
+                    }
+                    // Chain-specific fee selection is relevant only when validation is enabled and
+                    // the request did not supply the fee itself. Run it after block overrides so
+                    // timestamp-sensitive policies observe the simulated block's actual time.
+                    if validation && !has_base_fee_override {
+                        this.apply_simulation_evm_env_overrides(&parent, &mut evm_env)?;
                     }
                     if let Some(ref state_overrides) = state_overrides {
                         apply_state_overrides(state_overrides.clone(), &mut db)
@@ -546,6 +555,19 @@ pub trait Call:
 
     /// Returns the maximum memory the EVM can allocate per RPC request.
     fn evm_memory_limit(&self) -> u64;
+
+    /// Applies chain-specific overrides to a simulated next-block EVM environment.
+    ///
+    /// This runs only when validation is enabled and no explicit base-fee override was supplied,
+    /// after request-level block overrides are applied. The default is a no-op so standard
+    /// Ethereum simulation behavior is unchanged.
+    fn apply_simulation_evm_env_overrides(
+        &self,
+        _parent: &SealedHeader<HeaderTy<Self::Primitives>>,
+        _evm_env: &mut EvmEnvFor<Self::Evm>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
 
     /// Returns the max gas limit that the caller can afford given a transaction environment.
     fn caller_gas_allowance(
