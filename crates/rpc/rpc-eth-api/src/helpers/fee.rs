@@ -143,6 +143,29 @@ pub trait EthFees:
             // NOTE: We ensured that block count is capped
             let start_block = end_block_plus - block_count;
 
+            // Read the requested range and its possible canonical child in one consistent provider
+            // snapshot. Separate endpoint and child lookups can straddle a reorg and incorrectly
+            // apply a pending quote to an orphaned endpoint.
+            let canonical_headers = self
+                .provider()
+                .sealed_headers_range(start_block..=end_block_plus)
+                .map_err(Self::Error::from_eth_err)?;
+            let requested_len = block_count as usize;
+            if canonical_headers.len() < requested_len ||
+                canonical_headers.len() > requested_len + 1
+            {
+                return Err(EthApiError::InvalidBlockRange.into())
+            }
+            let headers = &canonical_headers[..requested_len];
+            let canonical_last = headers.last().expect("block count is non-zero");
+            if canonical_last.number() != end_block {
+                return Err(EthApiError::InvalidBlockRange.into())
+            }
+            let canonical_child = canonical_headers.get(requested_len);
+            if canonical_child.is_some_and(|child| child.parent_hash() != canonical_last.hash()) {
+                return Err(EthApiError::InvalidBlockRange.into())
+            }
+
             // Collect base fees, gas usage ratios and (optionally) reward percentile data
             // Pre-allocate capacity: base_fee and blob_fee need +1 for the next block's fee
             let mut base_fee_per_gas: Vec<u128> = Vec::with_capacity(block_count as usize + 1);
@@ -185,39 +208,19 @@ pub trait EthFees:
                 // Also need to include the `base_fee_per_gas` and `base_fee_per_blob_gas` for the
                 // next block. For a historical range the child is already canonical, and a custom
                 // pending-fee provider is not necessarily able to reproduce its selected fee.
-                let canonical_last = self
-                    .provider()
-                    .sealed_header(end_block)
-                    .map_err(Self::Error::from_eth_err)?
-                    .ok_or(EthApiError::HeaderNotFound(end_block.into()))?;
                 if canonical_last.hash() != last_entry.header.hash_slow() {
                     return Err(EthApiError::InvalidBlockRange.into())
                 }
-                let next_base_fee = match self
-                    .provider()
-                    .sealed_header(end_block_plus)
-                    .map_err(Self::Error::from_eth_err)?
-                {
-                    Some(child) if child.parent_hash() == canonical_last.hash() => {
-                        child.base_fee_per_gas()
-                    }
-                    Some(_) => return Err(EthApiError::InvalidBlockRange.into()),
-                    None => self.pending_base_fee(&last_entry.header)?,
+                let next_base_fee = match canonical_child {
+                    Some(child) => child.base_fee_per_gas(),
+                    None => self.pending_base_fee(canonical_last.header())?,
                 };
                 base_fee_per_gas.push(next_base_fee.unwrap_or_default() as u128);
 
                 base_fee_per_blob_gas.push(last_entry.next_block_blob_fee().unwrap_or_default());
             } else {
-                // read the requested header range
-                let headers = self.provider()
-                    .sealed_headers_range(start_block..=end_block)
-                    .map_err(Self::Error::from_eth_err)?;
-                if headers.len() != block_count as usize {
-                    return Err(EthApiError::InvalidBlockRange.into())
-                }
-
                 let chain_spec = self.provider().chain_spec();
-                for header in &headers {
+                for header in headers {
                     base_fee_per_gas.push(header.base_fee_per_gas().unwrap_or_default() as u128);
                     gas_used_ratio.push(header.gas_used() as f64 / header.gas_limit() as f64);
 
@@ -263,23 +266,8 @@ pub trait EthFees:
                 //
                 // The unwrap is safe since we checked earlier that we got at least 1 header.
                 let last_header = headers.last().expect("is present");
-                let canonical_last = self
-                    .provider()
-                    .sealed_header(end_block)
-                    .map_err(Self::Error::from_eth_err)?
-                    .ok_or(EthApiError::HeaderNotFound(end_block.into()))?;
-                if canonical_last.hash() != last_header.hash() {
-                    return Err(EthApiError::InvalidBlockRange.into())
-                }
-                let next_base_fee = match self
-                    .provider()
-                    .sealed_header(end_block_plus)
-                    .map_err(Self::Error::from_eth_err)?
-                {
-                    Some(child) if child.parent_hash() == canonical_last.hash() => {
-                        child.base_fee_per_gas()
-                    }
-                    Some(_) => return Err(EthApiError::InvalidBlockRange.into()),
+                let next_base_fee = match canonical_child {
+                    Some(child) => child.base_fee_per_gas(),
                     None => self.pending_base_fee(last_header.header())?,
                 };
                 base_fee_per_gas.push(next_base_fee.unwrap_or_default() as u128);

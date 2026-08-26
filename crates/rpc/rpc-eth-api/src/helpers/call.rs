@@ -129,6 +129,9 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
 
                 for block in block_state_calls {
                     let SimBlock { block_overrides, state_overrides, calls } = block;
+                    let has_base_fee_override = block_overrides
+                        .as_ref()
+                        .is_some_and(|overrides| overrides.base_fee.is_some());
 
                     let attributes = this
                         .pending_env_builder()
@@ -140,7 +143,6 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                         .next_evm_env(&parent, &attributes)
                         .map_err(RethError::other)
                         .map_err(Self::Error::from_eth_err)?;
-                    this.apply_simulation_evm_env_overrides(&parent, &mut evm_env)?;
 
                     // Always disable EIP-3607
                     evm_env.cfg_env.disable_eip3607 = true;
@@ -178,6 +180,12 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                             &mut db,
                             evm_env.block_env.inner_mut(),
                         );
+                    }
+                    // Chain-specific fee selection is relevant only when validation is enabled and
+                    // the request did not supply the fee itself. Run it after block overrides so
+                    // timestamp-sensitive policies observe the simulated block's actual time.
+                    if validation && !has_base_fee_override {
+                        this.apply_simulation_evm_env_overrides(&parent, &mut evm_env)?;
                     }
                     if let Some(ref state_overrides) = state_overrides {
                         apply_state_overrides(state_overrides.clone(), &mut db)
@@ -550,8 +558,9 @@ pub trait Call:
 
     /// Applies chain-specific overrides to a simulated next-block EVM environment.
     ///
-    /// This runs before request-level validation and block overrides are applied. The default is a
-    /// no-op so standard Ethereum simulation behavior is unchanged.
+    /// This runs only when validation is enabled and no explicit base-fee override was supplied,
+    /// after request-level block overrides are applied. The default is a no-op so standard
+    /// Ethereum simulation behavior is unchanged.
     fn apply_simulation_evm_env_overrides(
         &self,
         _parent: &SealedHeader<HeaderTy<Self::Primitives>>,
