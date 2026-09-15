@@ -1,6 +1,6 @@
 # Ensures that `Compact` codec changes are backwards compatible.
 #
-# 1) checkout `main`
+# 1) checkout the PR base, or the selected release for maintenance-branch pushes
 # 2) randomly generate and serialize to disk many different type vectors with `Compact` (eg. Header, Transaction, etc)
 # 3) checkout `pr`
 # 4) deserialize previously generated test vectors
@@ -35,6 +35,8 @@ jobs:
       - uses: rui314/setup-mold@7e4f20ad28a2e8ca6fd0892ccf72e2abb706b9c3 # v1
       - run: .github/scripts/install_llvm.sh ubuntu
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97.0"
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -42,9 +44,11 @@ jobs:
       - name: Checkout base
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.base_ref || 'main' }}
+          # Use v2.6.0's commit: the fork carries its history but does not mirror upstream tags.
+          # The maintenance branch must decode its release's data, not unreleased main formats.
+          ref: ${{ github.base_ref || (github.ref == 'refs/heads/optimism' && '73a3a00862a8f14f89e30da8de001456f18cfae0' || 'main') }}
           persist-credentials: false
-      # On `main` branch, generates test vectors and serializes them to disk using `Compact`.
+      # On the comparison base, generate test vectors and serialize them to disk using `Compact`.
       - name: Generate compact vectors
         run: |
           ${{ matrix.bin }} -- test-vectors compact --write
