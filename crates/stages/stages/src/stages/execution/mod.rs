@@ -96,6 +96,23 @@ where
     exex_manager_handle: ExExManagerHandle<E::Primitives>,
     /// Executor metrics.
     metrics: ExecutorMetrics,
+    /// Optional source explicitly bound to a fresh durable execution checkpoint.
+    state_sources: Option<BatchStateSources>,
+}
+
+#[derive(Clone)]
+struct BatchStateSources(
+    Arc<
+        dyn Fn((u64, alloy_primitives::B256)) -> reth_evm::state_source::ExecutionStateSource
+            + Send
+            + Sync,
+    >,
+);
+
+impl std::fmt::Debug for BatchStateSources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BatchStateSources").finish_non_exhaustive()
+    }
 }
 
 impl<E> ExecutionStage<E>
@@ -119,7 +136,39 @@ where
             post_unwind_commit_input: None,
             exex_manager_handle,
             metrics: ExecutorMetrics::default(),
+            state_sources: None,
         }
+    }
+
+    /// Enables independent reads for a stage run in a fresh write transaction from this factory.
+    ///
+    /// The caller guarantees that the transaction contains no uncommitted state changes before
+    /// `execute`. Custom write transactions should omit this opt-in. Each worker additionally
+    /// verifies the durable execution checkpoint and its canonical hash before opening its base.
+    pub fn with_provider_factory<N: reth_provider::providers::ProviderNodeTypes>(
+        mut self,
+        factory: reth_provider::ProviderFactory<N>,
+    ) -> Self {
+        self.state_sources = Some(BatchStateSources(Arc::new(move |checkpoint| {
+            let factory = factory.clone();
+            reth_evm::state_source::ExecutionStateSource(Arc::new(move || {
+                use reth_provider::StageCheckpointReader;
+                let provider = factory.provider()?;
+                if provider
+                    .get_stage_checkpoint(StageId::Execution)?
+                    .unwrap_or_default()
+                    .block_number !=
+                    checkpoint.0 ||
+                    provider.block_hash(checkpoint.0)? != Some(checkpoint.1)
+                {
+                    return Err(ProviderError::StateForHashNotFound(checkpoint.1));
+                }
+                Ok(Box::new(StateProviderDatabase::new(reth_provider::LatestStateProvider::new(
+                    provider,
+                ))) as Box<dyn reth_revm::Database<Error = ProviderError>>)
+            }))
+        })));
+        self
     }
 
     /// Create an execution stage with the provided executor.
@@ -305,7 +354,15 @@ where
         self.ensure_consistency(provider, input.checkpoint().block_number, None)?;
 
         let db = StateProviderDatabase(LatestStateProviderRef::new(provider));
-        let mut executor = self.evm_config.batch_executor(db);
+        let mut evm_config = self.evm_config.clone();
+        if let Some(sources) =
+            self.state_sources.as_ref().filter(|_| evm_config.wants_execution_state_source()) &&
+            let Some(hash) = provider.block_hash(input.checkpoint().block_number)?
+        {
+            evm_config = evm_config
+                .with_execution_state_source((sources.0)((input.checkpoint().block_number, hash)));
+        }
+        let mut executor = evm_config.batch_executor(db);
 
         // Progress tracking
         let mut stage_progress = start_block;
@@ -773,6 +830,27 @@ mod tests {
     use reth_stages_api::StageUnitCheckpoint;
     use reth_testing_utils::generators;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn independent_sources_require_opt_in_and_matching_durable_checkpoint() {
+        use reth_provider::StageCheckpointWriter;
+        let factory = create_test_provider_factory();
+        assert!(stage().state_sources.is_none(), "custom write transactions keep the default path");
+        let stage = stage().with_provider_factory(factory.clone());
+        let sources = stage.state_sources.unwrap();
+        let block =
+            reth_primitives_traits::RecoveredBlock::new_unhashed(Block::default(), Vec::new());
+        let hash = block.hash();
+        let writer = factory.provider_rw().unwrap();
+        writer.insert_block(&block).unwrap();
+        writer.save_stage_checkpoint(StageId::Execution, StageCheckpoint::new(0)).unwrap();
+        writer.commit().unwrap();
+        let source = (sources.0)((0, hash));
+        let worker = std::thread::spawn(move || source.0.open().is_ok());
+        assert!(worker.join().unwrap());
+        assert!((sources.0)((1, hash)).0.open().is_err());
+        assert!((sources.0)((0, alloy_primitives::B256::repeat_byte(99))).0.open().is_err());
+    }
 
     fn stage() -> ExecutionStage<EthEvmConfig> {
         let evm_config =

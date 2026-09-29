@@ -266,3 +266,57 @@ mod tests {
         );
     }
 }
+
+/// Read-only reuse of a parent cache without cloning its account or storage maps.
+#[derive(Debug)]
+pub struct SharedCachedReads<DB> {
+    /// Immutable cache from the same exact parent as `database`.
+    pub cache: alloc::sync::Arc<CachedReads>,
+    /// Independent parent reader.
+    pub database: DB,
+}
+
+impl<DB: DatabaseRef> DatabaseRef for SharedCachedReads<DB> {
+    type Error = DB::Error;
+    fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        self.cache
+            .accounts
+            .get(&address)
+            .map_or_else(|| self.database.basic_ref(address), |account| Ok(account.info.clone()))
+    }
+    fn storage_ref(&self, address: Address, slot: U256) -> Result<U256, Self::Error> {
+        self.cache
+            .accounts
+            .get(&address)
+            .and_then(|account| account.storage.get(&slot))
+            .map_or_else(|| self.database.storage_ref(address, slot), |value| Ok(*value))
+    }
+    fn code_by_hash_ref(&self, hash: B256) -> Result<Bytecode, Self::Error> {
+        self.cache
+            .contracts
+            .get(&hash)
+            .map_or_else(|| self.database.code_by_hash_ref(hash), |code| Ok(code.clone()))
+    }
+    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+        self.cache
+            .block_hashes
+            .get(&number)
+            .map_or_else(|| self.database.block_hash_ref(number), |hash| Ok(*hash))
+    }
+}
+
+impl<DB: DatabaseRef> Database for SharedCachedReads<DB> {
+    type Error = DB::Error;
+    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        self.basic_ref(address)
+    }
+    fn storage(&mut self, address: Address, slot: U256) -> Result<U256, Self::Error> {
+        self.storage_ref(address, slot)
+    }
+    fn code_by_hash(&mut self, hash: B256) -> Result<Bytecode, Self::Error> {
+        self.code_by_hash_ref(hash)
+    }
+    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+        self.block_hash_ref(number)
+    }
+}

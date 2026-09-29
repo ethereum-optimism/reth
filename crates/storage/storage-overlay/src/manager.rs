@@ -101,6 +101,16 @@ impl<N: NodePrimitives> OverlayManager<N> {
         }
     }
 
+    /// Retains the ancestry of one parent independently of persistence and pruning in this manager.
+    /// Database anchoring still occurs for every reader, so a persisted tip never means "latest".
+    pub fn pin_parent(&self, parent_hash: B256) -> Self {
+        let pinned = Self::default();
+        for block in self.parent_chain(parent_hash) {
+            pinned.insert_block(block);
+        }
+        pinned
+    }
+
     /// Creates an overlay builder for `parent_hash`.
     pub fn overlay_builder(&self, parent_hash: B256) -> OverlayBuilder<N> {
         OverlayBuilder::new(parent_hash, self.clone())
@@ -711,6 +721,28 @@ mod tests {
             .enumerate()
             .map(|(index, block)| with_unique_state(&block, index as u8 + 1))
             .collect()
+    }
+
+    #[test]
+    fn pinned_parent_retains_ancestry_after_live_graph_removal() {
+        let manager = OverlayManager::default();
+        let blocks = test_blocks();
+        for block in &blocks {
+            manager.insert_block(block.clone());
+        }
+        let parent = blocks[2].recovered_block().hash();
+        let anchor = blocks[0].recovered_block().parent_hash();
+        let pinned = manager.pin_parent(parent);
+        let (_, expected) = pinned.overlay_for_parent(parent, anchor).unwrap();
+        manager.remove_blocks(blocks.iter().map(|block| block.recovered_block().hash()));
+        assert!(manager.overlay_for_parent(parent, anchor).is_err());
+        let (_, actual) = pinned.overlay_for_parent(parent, anchor).unwrap();
+        assert!(Arc::ptr_eq(&expected, &actual));
+        // A persisted prefix uses only the retained suffix, never all of the old overlay.
+        let (_, suffix) =
+            pinned.overlay_for_parent(parent, blocks[1].recovered_block().hash()).unwrap();
+        assert_eq!(suffix.accounts.len(), 1);
+        assert!(pinned.overlay_for_parent(B256::repeat_byte(255), anchor).is_err());
     }
 
     #[test]
