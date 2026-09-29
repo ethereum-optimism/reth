@@ -356,14 +356,11 @@ where
         let db = StateProviderDatabase(LatestStateProviderRef::new(provider));
         let mut evm_config = self.evm_config.clone();
         if let Some(sources) =
-            self.state_sources.as_ref().filter(|_| evm_config.wants_execution_state_source())
+            self.state_sources.as_ref().filter(|_| evm_config.wants_execution_state_source()) &&
+            let Some(hash) = provider.block_hash(input.checkpoint().block_number)?
         {
-            if let Some(hash) = provider.block_hash(input.checkpoint().block_number)? {
-                evm_config = evm_config.with_execution_state_source((sources.0)((
-                    input.checkpoint().block_number,
-                    hash,
-                )));
-            }
+            evm_config = evm_config
+                .with_execution_state_source((sources.0)((input.checkpoint().block_number, hash)));
         }
         let mut executor = evm_config.batch_executor(db);
 
