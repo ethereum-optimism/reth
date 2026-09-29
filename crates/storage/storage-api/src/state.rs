@@ -2,7 +2,7 @@ use super::{
     AccountReader, BlockHashReader, BlockIdReader, StateProofProvider, StateRootProvider,
     StorageRootProvider,
 };
-use alloc::boxed::Box;
+use alloc::{boxed::Box, sync::Arc};
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_eips::{BlockId, BlockNumberOrTag};
 use alloy_primitives::{Address, BlockHash, BlockNumber, StorageKey, StorageValue, B256, U256};
@@ -28,6 +28,13 @@ pub trait StateReader: Send {
 
 /// Type alias of boxed [`StateProvider`].
 pub type StateProviderBox = Box<dyn StateProvider + Send + 'static>;
+
+/// An owned factory retaining the exact parent ancestry for independent execution readers.
+/// Each invocation must reproduce the requested state or fail; returning unqualified latest
+/// state is never valid. Implementations may retain physical caches for the lifetime of the
+/// factory.
+pub type PinnedStateProviderFactory =
+    Arc<dyn Fn() -> ProviderResult<StateProviderBox> + Send + Sync>;
 
 /// An abstraction for a type that provides state data.
 #[auto_impl(&, Arc, Box)]
@@ -146,6 +153,16 @@ pub trait TryIntoHistoricalStateProvider {
 /// to be used, since block `n` was executed on its parent block's state.
 #[auto_impl(&, Box, Arc)]
 pub trait StateProviderFactory: BlockIdReader + Send {
+    /// Opts into independent execution reads, retaining the requested parent's ancestry.
+    /// Custom providers default to no independent source; a hash alone does not prove that
+    /// their state overrides, caches, or transaction view can be independently reproduced.
+    fn pinned_state_by_block_hash(
+        &self,
+        _block: BlockHash,
+    ) -> ProviderResult<Option<PinnedStateProviderFactory>> {
+        Ok(None)
+    }
+
     /// Storage provider for latest block.
     fn latest(&self) -> ProviderResult<StateProviderBox>;
 

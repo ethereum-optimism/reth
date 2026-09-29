@@ -634,16 +634,13 @@ where
     where
         H: OnStateHook + 'static,
     {
-        let mut executor = self
-            .strategy_factory
-            .executor_for_block(&mut self.db, block)
-            .map_err(BlockExecutionError::other)?;
+        self.strategy_factory.set_execution_state_hook(&mut self.db, Some(Box::new(state_hook)));
+        let result = match self.strategy_factory.executor_for_block(&mut self.db, block) {
+            Ok(executor) => executor.execute_block(block.transactions_recovered()),
+            Err(error) => Err(BlockExecutionError::other(error)),
+        };
 
-        executor.evm_mut().db_mut().set_state_hook(Some(Box::new(state_hook)));
-
-        let result = executor.execute_block(block.transactions_recovered());
-
-        self.db.set_state_hook(None);
+        self.strategy_factory.set_execution_state_hook(&mut self.db, None);
         self.db.merge_transitions(BundleRetention::Reverts);
 
         result

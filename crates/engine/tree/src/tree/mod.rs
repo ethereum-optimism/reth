@@ -144,6 +144,12 @@ where
         + TryIntoHistoricalStateProvider
         + 'static,
 {
+    /// Retains the requested in-memory ancestry for execution-local independent readers.
+    pub fn with_pinned_parent(mut self) -> Self {
+        self.overlay_manager = self.overlay_manager.pin_parent(self.parent_hash);
+        self
+    }
+
     /// Creates a new state provider from this builder.
     pub fn build(&self) -> ProviderResult<StateProviderBox> {
         let overlay_builder = self.overlay_manager.overlay_builder(self.parent_hash);

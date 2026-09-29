@@ -742,6 +742,38 @@ impl<N: NodeTypesWithDB> ChainSpecProvider for BlockchainProvider<N> {
 }
 
 impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
+    fn pinned_state_by_block_hash(
+        &self,
+        hash: BlockHash,
+    ) -> ProviderResult<Option<reth_storage_api::PinnedStateProviderFactory>> {
+        let database = self.database.clone();
+        // Retain BlockState ancestry as well as the provider factory. Canonical memory can
+        // change while workers open new read transactions during persistence or a reorg.
+        let state = self.canonical_in_memory_state.state_by_hash(hash).or_else(|| {
+            self.canonical_in_memory_state
+                .pending_state()
+                .filter(|state| state.hash() == hash)
+                .map(Arc::new)
+        });
+        let blocks: Vec<_> =
+            state.iter().flat_map(|state| state.chain().map(|state| state.block())).collect();
+        Ok(Some(Arc::new(move || {
+            let provider = database.provider()?;
+            let (base, overlay): (StateProviderBox, _) =
+                match anchor_for_parent(hash, blocks.iter().cloned(), &provider)? {
+                    reth_storage_overlay::AnchorForParent::NoReverts { overlay, .. } => {
+                        (Box::new(LatestStateProvider::new(provider)), overlay)
+                    }
+                    reth_storage_overlay::AnchorForParent::RevertsRequired {
+                        anchor,
+                        overlay,
+                        ..
+                    } => (provider.try_into_history_at_block(anchor.number)?, overlay),
+                };
+            Ok(Box::new(MemoryOverlayStateProvider::new(base, overlay)))
+        })))
+    }
+
     /// Storage provider for latest block
     fn latest(&self) -> ProviderResult<StateProviderBox> {
         trace!(target: "providers::blockchain", "Getting latest block state provider");
@@ -1253,6 +1285,24 @@ mod tests {
                 hook_provider.canonical_in_memory_state.remove_persisted_blocks(num_hash);
             }
         }));
+    }
+
+    #[test]
+    fn pinned_execution_source_survives_memory_removal_and_persistence() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, _, memory, _) =
+            provider_with_random_blocks(&mut rng, 3, 2, BlockRangeParams::default())?;
+        let hash = memory.last().unwrap().hash();
+        let source = provider.pinned_state_by_block_hash(hash)?.unwrap();
+        // Opening an independent reader during persistence must retain the original parent.
+        persist_block_after_db_tx_creation(provider.clone(), 3);
+        let first = source()?;
+        let expected = first.block_hash(4)?;
+        assert_eq!(expected, Some(hash));
+        provider.canonical_in_memory_state.clear_state();
+        drop(first);
+        assert_eq!(source()?.block_hash(4)?, expected);
+        Ok(())
     }
 
     #[test]

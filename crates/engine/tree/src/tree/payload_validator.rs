@@ -666,43 +666,54 @@ where
         //
         // The second parameter `instrument_state_provider` controls whether we should
         // instrument the state provider with metrics.
-        let make_state_provider = |fill_on_miss: bool| -> ProviderResult<StateProviderBox> {
-            let provider = provider_builder.build()?;
-            let mut provider = if let Some((caches, cache_metrics)) = &execution_cache {
-                let fill_mode = if fill_on_miss {
-                    CacheFillMode::FillOnMiss
+        let provider_builder = if self.evm_config.wants_execution_state_source() {
+            provider_builder.with_pinned_parent()
+        } else {
+            provider_builder
+        };
+        let make_state_provider = {
+            let provider_builder = provider_builder.clone();
+            let cache_stats = cache_stats.clone();
+            let state_provider_stats = state_provider_stats.clone();
+            let state_provider_metrics = state_provider_metrics.clone();
+            move |fill_on_miss: bool| -> ProviderResult<StateProviderBox> {
+                let provider = provider_builder.build()?;
+                let mut provider = if let Some((caches, cache_metrics)) = &execution_cache {
+                    let fill_mode = if fill_on_miss {
+                        CacheFillMode::FillOnMiss
+                    } else {
+                        CacheFillMode::LookupOnly
+                    };
+                    Box::new(
+                        CachedStateProvider::new_with_mode(
+                            provider,
+                            caches.clone(),
+                            fill_mode,
+                            cache_metrics.clone(),
+                            cache_stats.clone(),
+                        )
+                        .with_txpool_snapshot(txpool_snapshot.clone()),
+                    ) as StateProviderBox
                 } else {
-                    CacheFillMode::LookupOnly
+                    provider
                 };
-                Box::new(
-                    CachedStateProvider::new_with_mode(
+
+                if instrument_state_provider {
+                    let stats = state_provider_stats
+                        .as_ref()
+                        .expect("instrumented state provider requires shared stats");
+                    let metrics = state_provider_metrics
+                        .as_ref()
+                        .expect("instrumented state provider requires metrics");
+                    provider = Box::new(InstrumentedStateProvider::with_stats(
                         provider,
-                        caches.clone(),
-                        fill_mode,
-                        cache_metrics.clone(),
-                        cache_stats.clone(),
-                    )
-                    .with_txpool_snapshot(txpool_snapshot.clone()),
-                ) as StateProviderBox
-            } else {
-                provider
-            };
+                        metrics.clone(),
+                        Arc::clone(stats),
+                    ));
+                }
 
-            if instrument_state_provider {
-                let stats = state_provider_stats
-                    .as_ref()
-                    .expect("instrumented state provider requires shared stats");
-                let metrics = state_provider_metrics
-                    .as_ref()
-                    .expect("instrumented state provider requires metrics");
-                provider = Box::new(InstrumentedStateProvider::with_stats(
-                    provider,
-                    metrics.clone(),
-                    Arc::clone(stats),
-                ));
+                Ok(provider)
             }
-
-            Ok(provider)
         };
 
         // Execute the block and handle any execution errors.
@@ -720,6 +731,10 @@ where
                     &input,
                     &mut handle,
                     execution_state_hook,
+                    reth_evm::state_source::ExecutionStateSource(Arc::new(move || {
+                        Ok(Box::new(StateProviderDatabase::new(make_state_provider(true)?))
+                            as Box<dyn revm::Database<Error = reth_provider::ProviderError>>)
+                    })),
                 ),
                 Err(err) => Err(err.into()),
             }
@@ -988,6 +1003,7 @@ where
         input: &BlockOrPayload<T>,
         handle: &mut PayloadHandle<impl ExecutableTxFor<Evm>, Err, N::Receipt>,
         state_hook: Option<Box<dyn OnStateHook + 'static>>,
+        state_source: reth_evm::state_source::ExecutionStateSource,
     ) -> Result<
         (
             BlockExecutionOutput<N::Receipt>,
@@ -1015,15 +1031,17 @@ where
                 .build()
         });
 
+        let evm_config =
+            self.evm_config.clone().with_jit_support().with_execution_state_source(state_source);
+        evm_config.set_execution_state_hook(&mut db, state_hook);
         let (spec_id, mut executor) = {
             let _span = debug_span!(target: "engine::tree", "create_evm").entered();
             let spec_id = *env.evm_env.spec_id();
-            let evm_config = self.evm_config.clone().with_jit_support();
             let evm = evm_config.evm_with_env(&mut db, env.evm_env);
             let ctx = self
                 .execution_ctx_for(input)
                 .map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?;
-            let executor = self.evm_config.create_executor(evm, ctx);
+            let executor = evm_config.create_executor(evm, ctx);
             (spec_id, executor)
         };
 
@@ -1049,7 +1067,6 @@ where
         let transaction_count = input.transaction_count();
         let (receipt_tx, result_rx) = self.spawn_receipt_root_task(transaction_count);
         let executed_tx_index = Arc::clone(handle.executed_tx_index());
-        executor.evm_mut().db_mut().set_state_hook(state_hook);
 
         let execution_start = Instant::now();
 

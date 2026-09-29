@@ -41,6 +41,9 @@ mod aliases;
 pub use aliases::*;
 
 #[cfg(feature = "std")]
+pub mod state_source;
+
+#[cfg(feature = "std")]
 mod engine;
 #[cfg(feature = "std")]
 pub use engine::{ConfigureEngineEvm, ConvertTx, ExecutableTxIterator, ExecutableTxTuple};
@@ -181,6 +184,16 @@ pub use alloy_evm::{
 /// [`BlockExecutor`]: alloy_evm::block::BlockExecutor
 #[auto_impl::auto_impl(&, Arc)]
 pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
+    /// Supplies an independent read source for one block, build or historical batch.
+    /// The default preserves the existing execution path. The caller must provide the exact
+    /// canonical base; account/storage overlays accumulated during execution remain the
+    /// executor's responsibility. Never reuse this configured clone across independent builds.
+    #[cfg(feature = "std")]
+    #[auto_impl(keep_default_for(&, Arc))]
+    fn with_execution_state_source(self, _source: state_source::ExecutionStateSource) -> Self {
+        self
+    }
+
     /// The primitives type used by the EVM.
     type Primitives: NodePrimitives;
 
@@ -335,6 +348,23 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
         I: InspectorFor<Self, DB>,
     {
         self.evm_factory().create_evm_with_inspector(db, evm_env, inspector)
+    }
+
+    /// Whether this execution configuration can use an operation-local independent state source.
+    /// Callers can avoid retaining additional ancestry and caches for sequential execution.
+    #[cfg(feature = "std")]
+    fn wants_execution_state_source(&self) -> bool {
+        false
+    }
+
+    /// Installs or removes a public committed-state hook. Implementations can compose it with
+    /// internal change tracking without allowing public hook replacement to detach that tracking.
+    fn set_execution_state_hook<DB: Database>(
+        &self,
+        state: &mut State<DB>,
+        hook: Option<alloc::boxed::Box<dyn revm::database_interface::OnStateHook>>,
+    ) {
+        state.set_state_hook(hook);
     }
 
     /// Creates a strategy with given EVM and execution context.
