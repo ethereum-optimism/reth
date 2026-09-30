@@ -22,6 +22,7 @@ use reth_rpc_eth_api::{
     RpcLog, RpcNodeCoreExt, RpcTransaction,
 };
 use reth_rpc_eth_types::{
+    block::BlockAndReceipts,
     logs_utils::{self, append_matching_block_logs, ProviderOrBlock},
     EthApiError, EthFilterConfig, EthStateCache, EthSubscriptionIdProvider,
 };
@@ -554,48 +555,55 @@ where
                 Ok(all_logs)
             }
             FilterBlockOption::Range { from_block, to_block } => {
-                // Handle special case where from block is pending
-                if from_block.is_some_and(|b| b.is_pending()) {
+                let from_is_pending = from_block.is_some_and(|block| block.is_pending());
+                let to_is_pending = to_block.is_some_and(|block| block.is_pending());
+
+                if from_is_pending {
                     let to_block = to_block.unwrap_or(BlockNumberOrTag::Pending);
                     if !(to_block.is_pending() || to_block.is_number()) {
                         // always empty range
                         return Ok(Vec::new());
                     }
-                    // Try to get pending block and receipts
-                    if let Ok(Some(pending_block)) = self.eth_api.local_pending_block().await {
-                        if let BlockNumberOrTag::Number(to_block) = to_block &&
-                            to_block < pending_block.block.number()
-                        {
-                            // this block range is empty based on the user input
-                            return Ok(Vec::new());
-                        }
-
-                        let info = self.provider().chain_info()?;
-                        if pending_block.block.number() > info.best_number {
-                            // only consider the pending block if it is ahead of the chain
-                            let mut all_logs = Vec::new();
-                            let header = pending_block.block.clone_sealed_header();
-                            append_matching_block_logs(
-                                &mut all_logs,
-                                self.eth_api.converter(),
-                                ProviderOrBlock::<Eth::Provider>::Block(pending_block.block),
-                                &filter,
-                                &header,
-                                &pending_block.receipts,
-                                false, // removed = false for pending blocks
-                            )?;
-                            return Ok(all_logs)
-                        }
-                    }
                 }
 
+                let pending_block = if from_is_pending || to_is_pending {
+                    self.eth_api.local_pending_block().await.ok().flatten()
+                } else {
+                    None
+                };
+                // Resolve the head after loading the pending block so that a block promoted while
+                // the lookup was in flight is scanned as canonical instead of being omitted.
                 let info = self.provider().chain_info()?;
+                let pending_block = pending_block.filter(|pending| {
+                    pending.block.number() == info.best_number.saturating_add(1) &&
+                        pending.block.parent_hash() == info.best_hash
+                });
+
+                // A range that starts at pending can only contain the local pending block.
+                if from_is_pending && let Some(pending_block) = pending_block {
+                    if let Some(BlockNumberOrTag::Number(to_block)) = to_block &&
+                        to_block < pending_block.block.number()
+                    {
+                        return Ok(Vec::new());
+                    }
+
+                    let mut all_logs = Vec::new();
+                    self.append_pending_logs(&mut all_logs, pending_block, &filter)?;
+                    return Ok(all_logs)
+                }
+
                 let start_block = info.best_number;
                 // Without a pending block to serve, a `pending` bound resolves to the head on both
-                // ends instead of to whatever payload the engine currently holds
+                // ends instead of to whatever payload the engine currently holds.
                 let from = from_block
                     .filter(|num| !num.is_pending())
-                    .map(|num| self.provider().convert_block_number(num))
+                    .map(|num| {
+                        if num.is_latest() {
+                            Ok(Some(info.best_number))
+                        } else {
+                            self.provider().convert_block_number(num)
+                        }
+                    })
                     .transpose()?
                     .flatten();
                 let to = to_block
@@ -614,8 +622,24 @@ where
                     });
                 }
 
-                let (from_block_number, to_block_number) =
-                    logs_utils::get_filter_block_range(from, to, start_block, info)?;
+                let pending_block = if to_is_pending { pending_block } else { None };
+                let (from_block_number, to_block_number) = if pending_block.is_some() {
+                    (from.unwrap_or(start_block), to.unwrap_or(info.best_number))
+                } else {
+                    logs_utils::get_filter_block_range(from, to, start_block, info)?
+                };
+
+                if let Some(pending) = &pending_block {
+                    let pending_number = pending.block.number();
+                    if from_block_number > pending_number {
+                        return Err(EthFilterError::InvalidBlockRangeParams)
+                    }
+                    if let Some(limit) = limits.max_blocks_per_filter &&
+                        pending_number - from_block_number > limit
+                    {
+                        return Err(EthFilterError::QueryExceedsMaxBlocks(limit))
+                    }
+                }
 
                 // Check if the requested range overlaps with pruned history (EIP-4444)
                 let earliest_block = self.provider().earliest_block_number()?;
@@ -627,10 +651,64 @@ where
                     .into());
                 }
 
-                self.get_logs_in_block_range(filter, from_block_number, to_block_number, limits)
-                    .await
+                let mut all_logs = if pending_block.is_some() && from_block_number > to_block_number
+                {
+                    Vec::new()
+                } else {
+                    self.clone()
+                        .get_logs_in_block_range(
+                            filter.clone(),
+                            from_block_number,
+                            to_block_number,
+                            limits,
+                        )
+                        .await?
+                };
+
+                if let Some(pending_block) = pending_block {
+                    // Do not combine logs from different canonical branches if the head changed
+                    // while the range scan was in flight.
+                    if self.provider().chain_info()? != info {
+                        return Err(EthFilterError::InternalError)
+                    }
+
+                    let pending_number = pending_block.block.number();
+                    self.append_pending_logs(&mut all_logs, pending_block, &filter)?;
+
+                    if let Some(max_logs) = limits.max_logs_per_response &&
+                        from_block_number != pending_number &&
+                        all_logs.len() > max_logs
+                    {
+                        return Err(EthFilterError::QueryExceedsMaxResults {
+                            max_logs,
+                            from_block: from_block_number,
+                            to_block: info.best_number,
+                        })
+                    }
+                }
+
+                Ok(all_logs)
             }
         }
+    }
+
+    fn append_pending_logs(
+        &self,
+        all_logs: &mut Vec<RpcLog<Eth::NetworkTypes>>,
+        pending_block: BlockAndReceipts<Eth::Primitives>,
+        filter: &Filter,
+    ) -> Result<(), EthFilterError> {
+        let header = pending_block.block.clone_sealed_header();
+        append_matching_block_logs(
+            all_logs,
+            self.eth_api.converter(),
+            ProviderOrBlock::<Eth::Provider>::Block(pending_block.block),
+            filter,
+            &header,
+            &pending_block.receipts,
+            false,
+        )?;
+        Ok(())
     }
 
     /// Installs a new filter and returns the new identifier.
@@ -2294,6 +2372,151 @@ mod tests {
                 .unwrap();
             assert!(logs.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn test_logs_for_filter_pending_to_block_includes_local_pending_block() {
+        use alloy_consensus::TxLegacy;
+        use alloy_primitives::{Address, Bloom, Bytes, Log, LogData, Signature};
+        use reth_db_api::models::StoredBlockBodyIndices;
+        use reth_ethereum_primitives::{Block, BlockBody, Receipt, TransactionSigned};
+        use reth_primitives_traits::RecoveredBlock;
+
+        let provider = MockEthProvider::default();
+        let transaction = TransactionSigned::new_unhashed(
+            TxLegacy {
+                chain_id: Some(1),
+                gas_price: 21_000,
+                gas_limit: 21_000,
+                ..Default::default()
+            }
+            .into(),
+            Signature::test_signature(),
+        );
+        let log_address = Address::repeat_byte(0x42);
+        let receipt = Receipt {
+            tx_type: TxType::Legacy,
+            cumulative_gas_used: 21_000,
+            logs: vec![Log {
+                address: log_address,
+                data: LogData::new_unchecked(vec![], Bytes::new()),
+            }],
+            success: true,
+        };
+        let header = alloy_consensus::Header {
+            number: 2,
+            logs_bloom: Bloom::from([1u8; 256]),
+            ..Default::default()
+        };
+        let hash = header.hash_slow();
+        provider.add_block(
+            hash,
+            Block {
+                header,
+                body: BlockBody { transactions: vec![transaction.clone()], ..Default::default() },
+            },
+        );
+        provider.add_receipts(2, vec![receipt.clone()]);
+        provider.add_block_body_indices(2, StoredBlockBodyIndices { first_tx_num: 0, tx_count: 1 });
+
+        let pending = RecoveredBlock::new_unhashed(
+            Block {
+                header: alloy_consensus::Header {
+                    number: 3,
+                    parent_hash: hash,
+                    ..Default::default()
+                },
+                body: BlockBody { transactions: vec![transaction.clone()], ..Default::default() },
+            },
+            vec![Address::ZERO],
+        );
+        provider.set_pending_block_and_receipts(Some((pending, vec![receipt.clone()])));
+
+        let eth_filter = EthFilter::new(
+            build_test_eth_api(provider.clone()),
+            EthFilterConfig::default(),
+            Runtime::test(),
+        );
+        let filter =
+            Filter::new().from_block(BlockNumberOrTag::Latest).to_block(BlockNumberOrTag::Pending);
+        let logs = eth_filter
+            .inner
+            .clone()
+            .logs_for_filter(filter.clone(), QueryLimits::default())
+            .await
+            .unwrap();
+
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs.iter().map(|log| log.block_number).collect::<Vec<_>>(), [Some(2), Some(3)]);
+        assert!(logs.iter().all(|log| log.inner.address == log_address));
+
+        let log_limit_err = eth_filter
+            .inner
+            .clone()
+            .logs_for_filter(
+                filter.clone(),
+                QueryLimits { max_blocks_per_filter: None, max_logs_per_response: Some(0) },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            log_limit_err,
+            EthFilterError::QueryExceedsMaxResults { max_logs: 0, from_block: 2, to_block: 2 }
+        ));
+
+        let block_limit_err = eth_filter
+            .inner
+            .clone()
+            .logs_for_filter(
+                filter,
+                QueryLimits { max_blocks_per_filter: Some(0), max_logs_per_response: None },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(block_limit_err, EthFilterError::QueryExceedsMaxBlocks(0)));
+
+        // As with canonical ranges, a single-block query returns all logs regardless of the
+        // response limit.
+        let pending_only = Filter::new().from_block(3u64).to_block(BlockNumberOrTag::Pending);
+        let logs = eth_filter
+            .inner
+            .clone()
+            .logs_for_filter(
+                pending_only,
+                QueryLimits { max_blocks_per_filter: None, max_logs_per_response: Some(0) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1);
+
+        let reversed_range = Filter::new().from_block(4u64).to_block(BlockNumberOrTag::Pending);
+        let err = eth_filter
+            .inner
+            .clone()
+            .logs_for_filter(reversed_range, QueryLimits::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EthFilterError::InvalidBlockRangeParams));
+
+        // Do not combine canonical logs with a pending block from a stale branch.
+        let stale_pending = RecoveredBlock::new_unhashed(
+            Block {
+                header: alloy_consensus::Header {
+                    number: 3,
+                    parent_hash: FixedBytes::repeat_byte(0xff),
+                    ..Default::default()
+                },
+                body: BlockBody { transactions: vec![transaction], ..Default::default() },
+            },
+            vec![Address::ZERO],
+        );
+        provider.set_pending_block_and_receipts(Some((stale_pending, vec![receipt])));
+        let filter =
+            Filter::new().from_block(BlockNumberOrTag::Latest).to_block(BlockNumberOrTag::Pending);
+        let logs =
+            eth_filter.inner.clone().logs_for_filter(filter, QueryLimits::default()).await.unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].block_number, Some(2));
     }
 
     #[tokio::test]
