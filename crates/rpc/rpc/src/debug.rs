@@ -42,7 +42,7 @@ use reth_storage_api::{
     ReceiptProviderIdExt, StateProviderBox, StateProviderFactory, StateRootProvider,
     StorageRootProvider, TransactionVariant,
 };
-use reth_tasks::{pool::BlockingTaskGuard, Runtime};
+use reth_tasks::{cancel::is_cancelled, pool::BlockingTaskGuard, Runtime};
 use reth_transaction_pool::TransactionPool;
 use reth_trie_common::{
     root::storage_root_unsorted, updates::TrieUpdates, ExecutionWitnessMode, HashedPostState,
@@ -139,6 +139,9 @@ where
 
                 let mut transactions = block.transactions_recovered().enumerate().peekable();
                 while let Some((index, tx)) = transactions.next() {
+                    if is_cancelled() {
+                        return Err(EthApiError::InternalEthError.into())
+                    }
                     let tx_env = eth_api.evm_config().tx_env(tx);
 
                     let output = executor
@@ -552,6 +555,9 @@ where
 
                     let mut transactions = transactions.into_iter().peekable();
                     while let Some(tx) = transactions.next() {
+                        if is_cancelled() {
+                            return Err(EthApiError::InternalEthError.into())
+                        }
                         // apply state overrides only once, before the first transaction
                         let state_overrides = state_overrides.take();
                         let overrides = EvmOverrides::new(state_overrides, block_overrides.clone());
@@ -824,6 +830,9 @@ where
 
                 let mut roots = Vec::with_capacity(block.body().transactions().len());
                 for tx in block.transactions_recovered() {
+                    if is_cancelled() {
+                        return Err(EthApiError::InternalEthError.into())
+                    }
                     executor.execute_transaction(tx).map_err(Eth::Error::from_eth_err)?;
 
                     let state = executor.evm_mut().db_mut();

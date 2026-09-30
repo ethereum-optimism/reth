@@ -46,7 +46,7 @@ use reth_rpc_eth_types::{
 use reth_storage_api::{
     BlockIdReader, EvmStateProviderAdapter, ProviderTx, StateProvider, StateProviderBox,
 };
-use reth_tasks::CancelOnDrop;
+use reth_tasks::{cancel::is_cancelled, CancelOnDrop};
 use revm::{
     context::Block,
     context_interface::{result::ResultAndState, Cfg, Transaction},
@@ -406,6 +406,10 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
 
                     // transact all transactions in the bundle
                     for (tx_index, tx) in transactions.into_iter().enumerate() {
+                        if is_cancelled() {
+                            return Err(EthApiError::InternalEthError.into())
+                        }
+
                         // Apply overrides, state overrides are only applied for the first tx in the
                         // request
                         let overrides =
@@ -808,6 +812,9 @@ pub trait Call:
         Txs: IntoIterator<Item = Recovered<&'a ProviderTx<Self::Provider>>>,
     {
         for tx in transactions.into_iter().take(target_tx_index) {
+            if is_cancelled() {
+                return Err(EthApiError::InternalEthError.into())
+            }
             executor.execute_transaction(tx).map_err(Self::Error::from_eth_err)?;
         }
         Ok(())
