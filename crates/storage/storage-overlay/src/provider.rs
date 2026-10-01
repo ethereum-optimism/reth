@@ -1361,4 +1361,184 @@ mod tests {
         assert_eq!(provider.basic_account(&address).unwrap(), Some(account));
         assert_eq!(provider.storage(address, storage_key).unwrap(), Some(storage));
     }
+
+    /// Hashed slot with the given first two bytes, so that the storage trie has stored branch
+    /// nodes at depth one that cache the hashes of their children.
+    fn hashed_slot(first: u8, second: u8) -> B256 {
+        let mut slot = alloy_primitives::keccak256([first, second]);
+        slot.0[0] = first;
+        slot.0[1] = second;
+        slot
+    }
+
+    /// Writes hashed state and trie updates like `save_blocks` does under partial persistence.
+    fn write_state_trie(
+        provider: &(impl reth_storage_api::StateWriter + reth_storage_api::TrieWriter),
+        batch: &[ExecutedBlock<EthPrimitives>],
+        mask: &[ExecutedBlock<EthPrimitives>],
+    ) {
+        provider
+            .write_hashed_state(&HashedPostStateSorted::disjointed_merge_batch(
+                &ExecutedBlock::hashed_state_refs(batch),
+                &ExecutedBlock::hashed_state_refs(mask),
+            ))
+            .unwrap();
+        provider
+            .write_trie_updates_sorted(&TrieUpdatesSorted::disjointed_merge_batch(
+                &ExecutedBlock::trie_updates_refs(batch),
+                &ExecutedBlock::trie_updates_refs(mask),
+            ))
+            .unwrap();
+    }
+
+    /// Storage roots over a partially persisted state trie must use the overlay trie nodes: the
+    /// database trie tables omit nodes overwritten by the masking suffix, so their cached child
+    /// hashes can be older than the persisted hashed state.
+    #[test]
+    fn storage_root_over_masked_state_trie() {
+        for settings in [reth_provider::StorageSettings::v1(), reth_provider::StorageSettings::v2()]
+        {
+            let address = Address::with_last_byte(0x16);
+            let hashed_address = alloy_primitives::keccak256(address);
+
+            let base = (0..=u8::MAX)
+                .flat_map(|first| {
+                    [0x00, 0x80].map(|second| (hashed_slot(first, second), U256::from(1)))
+                })
+                .collect::<Vec<_>>();
+            let changes: [Vec<(B256, U256)>; 8] = [
+                vec![],
+                base,
+                vec![
+                    (hashed_slot(0x10, 0x00), U256::from(2)),
+                    (hashed_slot(0x11, 0x42), U256::from(2)),
+                    (hashed_slot(0x20, 0x00), U256::ZERO),
+                ],
+                vec![(hashed_slot(0x30, 0x00), U256::from(3))],
+                vec![(hashed_slot(0x40, 0x80), U256::from(4))],
+                vec![
+                    (hashed_slot(0x30, 0x00), U256::from(5)),
+                    (hashed_slot(0x31, 0x00), U256::from(5)),
+                    (hashed_slot(0x50, 0x00), U256::from(5)),
+                    (hashed_slot(0x60, 0x80), U256::ZERO),
+                ],
+                vec![
+                    (hashed_slot(0x1f, 0x80), U256::ZERO),
+                    (hashed_slot(0x50, 0x00), U256::from(6)),
+                    (hashed_slot(0x70, 0x00), U256::from(6)),
+                ],
+                vec![
+                    (hashed_slot(0x50, 0x00), U256::from(7)),
+                    (hashed_slot(0x80, 0x00), U256::ZERO),
+                ],
+            ];
+            let block_updates = [
+                (hashed_slot(0x90, 0x42), U256::from(1)),
+                (hashed_slot(0xa0, 0x00), U256::from(8)),
+                (hashed_slot(0xb0, 0x80), U256::ZERO),
+            ];
+
+            // Like the engine's, each block's storage trie updates only contain modified nodes.
+            let reference = create_test_provider_factory();
+            reference.set_storage_settings_cache(settings);
+            let mut storage_nodes = std::collections::BTreeMap::new();
+            let blocks = TestBlockBuilder::eth()
+                .get_executed_blocks(0..changes.len() as u64)
+                .zip(&changes)
+                .map(|(block, changes)| {
+                    let mut hashed_state = HashedPostState::default().with_storages([(
+                        hashed_address,
+                        HashedStorage::from_iter(changes.iter().copied()),
+                    )]);
+                    if block.recovered_block().number == 1 {
+                        hashed_state = hashed_state
+                            .with_accounts([(hashed_address, Some(Account::default()))]);
+                    }
+                    let provider = reference.provider().unwrap();
+                    let (_, trie_updates) = reth_provider::LatestStateProviderRef::new(&provider)
+                        .state_root_with_updates(hashed_state.clone())
+                        .unwrap();
+                    drop(provider);
+                    let hashed_state = hashed_state.into_sorted();
+                    let trie_updates = trie_updates.into_sorted();
+                    let provider_rw = reference.provider_rw().unwrap();
+                    reth_storage_api::StateWriter::write_hashed_state(&*provider_rw, &hashed_state)
+                        .unwrap();
+                    reth_storage_api::TrieWriter::write_trie_updates_sorted(
+                        &*provider_rw,
+                        &trie_updates,
+                    )
+                    .unwrap();
+                    provider_rw.commit().unwrap();
+
+                    let modified_storage_nodes = trie_updates
+                        .storage_tries_ref()
+                        .get(&hashed_address)
+                        .map(|storage_trie| storage_trie.storage_nodes_ref())
+                        .unwrap_or_default()
+                        .iter()
+                        .filter(|(path, node)| match node {
+                            Some(node) => {
+                                storage_nodes.insert(*path, node.clone()).as_ref() != Some(node)
+                            }
+                            None => storage_nodes.remove(path).is_some(),
+                        })
+                        .cloned()
+                        .collect();
+                    let trie_updates = TrieUpdatesSorted::new(
+                        trie_updates.account_nodes_ref().to_vec(),
+                        alloy_primitives::map::B256Map::from_iter([(
+                            hashed_address,
+                            reth_trie::updates::StorageTrieUpdatesSorted {
+                                storage_nodes: modified_storage_nodes,
+                            },
+                        )]),
+                    );
+                    ExecutedBlock::new(
+                        Arc::clone(&block.recovered_block),
+                        Arc::clone(&block.execution_output),
+                        ComputedTrieData::new(Arc::new(hashed_state), Arc::new(trie_updates)),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            let factory = create_test_provider_factory();
+            factory.set_storage_settings_cache(settings);
+            let provider_rw = factory.provider_rw().unwrap();
+            for block in &blocks[..=6] {
+                provider_rw.insert_block(block.recovered_block()).unwrap();
+            }
+            write_state_trie(&*provider_rw, &blocks[1..=1], &[]);
+            write_state_trie(&*provider_rw, &blocks[2..=4], &blocks[5..=6]);
+            provider_rw
+                .save_stage_checkpoint(
+                    StageId::Finish,
+                    StageCheckpoint::new(6).with_finish_stage_checkpoint(FinishCheckpoint {
+                        partial_state_trie: Some(4),
+                    }),
+                )
+                .unwrap();
+            provider_rw.commit().unwrap();
+
+            let manager = OverlayManager::default();
+            for block in &blocks[5..=7] {
+                manager.insert_block(block.clone());
+            }
+            let state_provider_factory = OverlayStateProviderFactory::new(
+                factory,
+                manager.overlay_builder(blocks[7].recovered_block().hash()),
+            );
+            let provider = state_provider_factory.database_provider_ro().unwrap();
+
+            let mut expected = std::collections::BTreeMap::new();
+            for (slot, value) in changes.iter().flatten().chain(&block_updates) {
+                expected.insert(*slot, *value);
+            }
+            expected.retain(|_, value| !value.is_zero());
+
+            let storage_root =
+                provider.storage_root(address, HashedStorage::from_iter(block_updates)).unwrap();
+            assert_eq!(storage_root, reth_trie::test_utils::storage_root_prehashed(expected));
+        }
+    }
 }
