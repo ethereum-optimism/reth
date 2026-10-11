@@ -16,8 +16,8 @@ use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumHash, BlockNumberOrTag};
 use alloy_primitives::{Address, BlockHash, BlockNumber, Bytes, TxHash, TxNumber, B256};
 use alloy_rpc_types_engine::ForkchoiceState;
 use reth_chain_state::{
-    CanonicalInMemoryState, ForkChoiceNotifications, ForkChoiceSubscriptions,
-    PersistedBlockNotifications, PersistedBlockSubscriptions,
+    CanonicalInMemoryState, CanonicalInMemoryStateProvider, ForkChoiceNotifications,
+    ForkChoiceSubscriptions, PersistedBlockNotifications, PersistedBlockSubscriptions,
 };
 use reth_chainspec::ChainInfo;
 use reth_db_api::models::{AccountBeforeTx, BlockNumberAddress, StoredBlockBodyIndices};
@@ -901,6 +901,12 @@ impl<N: ProviderNodeTypes> CanonStateSubscriptions for BlockchainProvider<N> {
     }
 }
 
+impl<N: ProviderNodeTypes> CanonicalInMemoryStateProvider for BlockchainProvider<N> {
+    fn canonical_in_memory_state(&self) -> CanonicalInMemoryState<Self::Primitives> {
+        self.canonical_in_memory_state.clone()
+    }
+}
+
 impl<N: ProviderNodeTypes> ForkChoiceSubscriptions for BlockchainProvider<N> {
     type Header = HeaderTy<N>;
 
@@ -1047,7 +1053,7 @@ mod tests {
     use rand::Rng;
     use reth_chain_state::{
         test_utils::TestBlockBuilder, CanonStateNotification, CanonStateSubscriptions,
-        CanonicalInMemoryState, ExecutedBlock, NewCanonicalChain,
+        CanonicalInMemoryState, CanonicalInMemoryStateProvider, ExecutedBlock, NewCanonicalChain,
     };
     use reth_chainspec::{ChainSpec, MAINNET};
     use reth_db_api::models::{AccountBeforeTx, StoredBlockBodyIndices};
@@ -1572,6 +1578,33 @@ mod tests {
                 .map(|block| block.hash())
                 .collect::<Vec<_>>()
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_canonical_in_memory_state_provider() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, database_blocks, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
+
+        let state = CanonicalInMemoryStateProvider::canonical_in_memory_state(&provider);
+        let database_block = database_blocks.last().unwrap();
+        let in_memory_block = in_memory_blocks.last().unwrap();
+
+        assert!(state.state_by_hash(database_block.hash()).is_none());
+        assert_eq!(
+            state.state_by_hash(in_memory_block.hash()).map(|state| state.hash()),
+            Some(in_memory_block.hash())
+        );
+
+        // The returned handle shares the provider's state rather than snapshotting it.
+        provider.canonical_in_memory_state.remove_persisted_blocks(in_memory_block.num_hash());
+        assert!(state.state_by_hash(in_memory_block.hash()).is_none());
 
         Ok(())
     }

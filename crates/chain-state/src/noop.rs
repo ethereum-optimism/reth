@@ -1,8 +1,9 @@
 //! Noop impls for testing.
 
 use crate::{
-    CanonStateNotifications, CanonStateSubscriptions, ForkChoiceNotifications,
-    ForkChoiceSubscriptions, PersistedBlockNotifications, PersistedBlockSubscriptions,
+    CanonStateNotifications, CanonStateSubscriptions, CanonicalInMemoryState,
+    CanonicalInMemoryStateProvider, ForkChoiceNotifications, ForkChoiceSubscriptions,
+    PersistedBlockNotifications, PersistedBlockSubscriptions,
 };
 use reth_primitives_traits::NodePrimitives;
 use reth_storage_api::noop::NoopProvider;
@@ -11,6 +12,12 @@ use tokio::sync::{broadcast, watch};
 impl<C: Send + Sync, N: NodePrimitives> CanonStateSubscriptions for NoopProvider<C, N> {
     fn subscribe_to_canonical_state(&self) -> CanonStateNotifications<N> {
         broadcast::channel(1).1
+    }
+}
+
+impl<C: Send + Sync, N: NodePrimitives> CanonicalInMemoryStateProvider for NoopProvider<C, N> {
+    fn canonical_in_memory_state(&self) -> CanonicalInMemoryState<N> {
+        CanonicalInMemoryState::empty()
     }
 }
 

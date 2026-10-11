@@ -16,7 +16,7 @@ use reth_primitives_traits::{
     BlockBody as _, IndexedTx, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader,
     SignedTransaction,
 };
-use reth_storage_api::StateProviderBox;
+use reth_storage_api::{NodePrimitivesProvider, StateProviderBox};
 use reth_trie::{
     updates::TrieUpdatesSorted, ComputedTrieData, HashedPostStateSorted, LazyTrieData,
 };
@@ -593,6 +593,21 @@ impl<N: NodePrimitives> CanonicalInMemoryState<N> {
             }
         }
         None
+    }
+}
+
+/// A type that provides access to the [`CanonicalInMemoryState`].
+///
+/// This exposes the canonical blocks that are not yet on disk, for example to read the execution
+/// outcome of a block whose state is not yet persisted.
+pub trait CanonicalInMemoryStateProvider: NodePrimitivesProvider + Send + Sync {
+    /// Returns a handle to the canonical in-memory state.
+    fn canonical_in_memory_state(&self) -> CanonicalInMemoryState<Self::Primitives>;
+}
+
+impl<T: CanonicalInMemoryStateProvider> CanonicalInMemoryStateProvider for &T {
+    fn canonical_in_memory_state(&self) -> CanonicalInMemoryState<Self::Primitives> {
+        (*self).canonical_in_memory_state()
     }
 }
 
