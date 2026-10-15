@@ -171,6 +171,15 @@ impl<T: PayloadTypes> PayloadBuilderHandle<T> {
         }
     }
 
+    /// Publishes a payload that was built outside of a payload job.
+    ///
+    /// Subscribers receive it as [`Events::BuiltPayload`], like a payload resolved from a job.
+    /// The engine inserts the executed block of a published payload into its tree, so a later
+    /// `newPayload` of that block does not execute it again.
+    pub fn publish_built_payload(&self, payload: T::BuiltPayload) {
+        let _ = self.to_service.send(PayloadServiceCommand::PublishBuiltPayload(payload));
+    }
+
     /// Sends a message to the service to subscribe to payload events.
     /// Returns a receiver that will receive them.
     pub async fn subscribe(&self) -> Result<PayloadEvents<T>, PayloadBuilderError> {
@@ -521,6 +530,9 @@ where
                         let new_rx = this.payload_events.subscribe();
                         let _ = tx.send(new_rx);
                     }
+                    PayloadServiceCommand::PublishBuiltPayload(payload) => {
+                        this.payload_events.send(Events::BuiltPayload(payload)).ok();
+                    }
                 }
             }
 
@@ -555,6 +567,8 @@ pub enum PayloadServiceCommand<T: PayloadTypes> {
     ),
     /// Payload service events
     Subscribe(oneshot::Sender<broadcast::Receiver<Events<T>>>),
+    /// Publish a payload that was built outside of a payload job
+    PublishBuiltPayload(T::BuiltPayload),
 }
 
 /// A request to build a new payload.
@@ -666,8 +680,10 @@ struct PayloadJobEntry<Job> {
 mod tests {
     use super::*;
     use crate::test_utils::test_payload_service;
-    use alloy_primitives::Address;
-    use reth_ethereum_engine_primitives::{EthEngineTypes, EthPayloadAttributes};
+    use alloy_consensus::Block;
+    use alloy_primitives::{Address, U256};
+    use reth_ethereum_engine_primitives::{EthBuiltPayload, EthEngineTypes, EthPayloadAttributes};
+    use reth_primitives_traits::{Block as _, RecoveredBlock};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct DropProbe(Arc<AtomicBool>);
@@ -704,6 +720,28 @@ mod tests {
 
             handle.resolve_kind(id, PayloadKind::Earliest).await.unwrap().unwrap();
             assert!(dropped.load(Ordering::Acquire));
+            service.abort();
+        });
+    }
+
+    #[test]
+    fn published_payload_reaches_subscribers() {
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(async {
+            let (service, handle) = test_payload_service::<EthEngineTypes>();
+            let service = tokio::spawn(service);
+            let mut built_payloads = handle.subscribe().await.unwrap().into_built_payload_stream();
+
+            let payload = EthBuiltPayload::new(
+                Arc::new(RecoveredBlock::new_sealed(Block::<_>::default().seal_slow(), vec![])),
+                U256::from(1),
+                None,
+                None,
+            );
+            handle.publish_built_payload(payload.clone());
+
+            let published = built_payloads.next().await.unwrap();
+            assert_eq!(published.block().hash(), payload.block().hash());
+            assert_eq!(published.fees(), payload.fees());
             service.abort();
         });
     }
