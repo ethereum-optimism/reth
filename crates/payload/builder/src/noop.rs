@@ -51,7 +51,8 @@ where
                 PayloadServiceCommand::BestPayload(_, tx) => tx.send(None).ok(),
                 PayloadServiceCommand::PayloadTimestamp(_, tx) => tx.send(None).ok(),
                 PayloadServiceCommand::Resolve(_, _, tx) => tx.send(None).ok(),
-                PayloadServiceCommand::Subscribe(_) => None,
+                PayloadServiceCommand::Subscribe(_) |
+                PayloadServiceCommand::PublishBuiltPayload(_) => None,
             };
         }
     }
