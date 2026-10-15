@@ -612,7 +612,7 @@ where
                 let inconsistency_source = match (rocksdb_unwind, static_file_unwind) {
                     (Some(_), Some(_)) => "RocksDB and static file",
                     (Some(_), None) => "RocksDB",
-                    (None, Some(_)) => "static file",
+                    (None, Some(_)) => "static file or interrupted pipeline unwind",
                     (None, None) => unreachable!(),
                 };
                 assert_ne!(

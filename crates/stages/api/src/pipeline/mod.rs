@@ -7,9 +7,10 @@ pub use event::*;
 use futures_util::Future;
 use reth_primitives_traits::constants::BEACON_CONSENSUS_REORG_UNWIND_DEPTH;
 use reth_provider::{
-    providers::ProviderNodeTypes, BlockHashReader, BlockNumReader, ChainStateBlockReader,
-    ChainStateBlockWriter, DBProvider, DatabaseProviderFactory, ProviderFactory,
-    PruneCheckpointReader, StageCheckpointReader, StageCheckpointWriter, StorageSettingsCache,
+    pending_pipeline_unwind_target, providers::ProviderNodeTypes, BlockHashReader, BlockNumReader,
+    ChainStateBlockReader, ChainStateBlockWriter, DBProvider, DatabaseProviderFactory,
+    MetadataWriter, ProviderError, ProviderFactory, PruneCheckpointReader, StageCheckpointReader,
+    StageCheckpointWriter, StorageSettingsCache, PENDING_PIPELINE_UNWIND_KEY,
 };
 use reth_prune::PrunerBuilder;
 use reth_static_file::StaticFileProducer;
@@ -305,16 +306,26 @@ impl<N: ProviderNodeTypes> Pipeline<N> {
         to: BlockNumber,
         bad_block: Option<BlockNumber>,
     ) -> Result<(), PipelineError> {
-        // Add validation before starting unwind
-        let (latest_block, prune_modes, checkpoints) = {
+        // The target is persisted before any stage commits. On restart, a partially unwound
+        // database must finish unwinding before forward stages may trust their checkpoints.
+        let (to, pending_target, latest_block, prune_modes, checkpoints) = {
             let provider = self.provider_factory.provider()?;
+            let pending_target = pending_pipeline_unwind_target(&provider)?;
             (
+                pending_target.map_or(to, |pending| pending.min(to)),
+                pending_target,
                 provider.last_block_number()?,
                 provider.prune_modes_ref().clone(),
                 provider.get_prune_checkpoints()?,
             )
         };
         prune_modes.ensure_unwind_target_unpruned(latest_block, to, &checkpoints)?;
+
+        if pending_target != Some(to) {
+            let provider_rw = self.provider_factory.database_provider_rw()?;
+            provider_rw.write_metadata(PENDING_PIPELINE_UNWIND_KEY, to.to_be_bytes().to_vec())?;
+            provider_rw.commit()?;
+        }
 
         // Unwind stages in reverse order of execution
         let unwind_pipeline = self.stages.iter_mut().rev();
@@ -424,6 +435,28 @@ impl<N: ProviderNodeTypes> Pipeline<N> {
                 }
             }
         }
+
+        // Repeating a completed unwind is safe. Keep the marker until every stage has
+        // committed so another interruption resumes the same target.
+        for stage_id in [
+            StageId::Finish,
+            StageId::MerkleExecute,
+            StageId::StorageHashing,
+            StageId::AccountHashing,
+            StageId::MerkleUnwind,
+            StageId::Execution,
+        ] {
+            if provider_rw.get_stage_checkpoint(stage_id)?.unwrap_or_default().block_number > to {
+                return Err(ProviderError::other(std::io::Error::other(format!(
+                    "cannot finish pipeline unwind: {stage_id} remains above block {to}",
+                )))
+                .into());
+            }
+        }
+        drop(provider_rw);
+        let provider_rw = self.provider_factory.database_provider_rw()?;
+        provider_rw.delete_metadata(PENDING_PIPELINE_UNWIND_KEY)?;
+        provider_rw.commit()?;
 
         Ok(())
     }
