@@ -125,6 +125,17 @@ pub trait StateWriter {
         &self,
         block: BlockNumber,
     ) -> ProviderResult<ExecutionOutcome<Self::Receipt>>;
+
+    /// Take state after `block` through the current Execution tip `end`, inclusive, recreating
+    /// the [`ExecutionOutcome`]. The default retains the unbounded behavior for providers that do
+    /// not support bounded state removal.
+    fn take_state_above_until(
+        &self,
+        block: BlockNumber,
+        _end: BlockNumber,
+    ) -> ProviderResult<ExecutionOutcome<Self::Receipt>> {
+        self.take_state_above(block)
+    }
 }
 
 /// Configuration for what to write to the database (MDBX) when calling
