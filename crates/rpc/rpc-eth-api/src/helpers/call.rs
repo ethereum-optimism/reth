@@ -21,8 +21,10 @@ use futures::Future;
 use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks};
 use reth_errors::{ProviderError, RethError};
 use reth_evm::{
-    block::BlockExecutor, env::BlockEnvironment, execute::BlockBuilder, ConfigureEvm, Evm,
-    EvmEnvFor, EvmFor, HaltReasonFor, InspectorFor, TransactionEnvMut, TxEnvFor,
+    block::{BlockExecutor, TxResult},
+    env::BlockEnvironment,
+    execute::BlockBuilder,
+    ConfigureEvm, Evm, EvmEnvFor, EvmFor, HaltReasonFor, InspectorFor, TransactionEnvMut, TxEnvFor,
 };
 use reth_node_api::BlockBody;
 use reth_primitives_traits::Recovered;
@@ -717,9 +719,10 @@ pub trait Call:
                     executor.execute_transaction(block_tx).map_err(Self::Error::from_eth_err)?;
                 }
 
-                let tx_env = RpcNodeCore::evm_config(&this).tx_env(tx);
-
-                let res = executor.evm_mut().transact(tx_env).map_err(Self::Error::from_evm_err)?;
+                let res = executor
+                    .execute_transaction_without_commit(tx)
+                    .map_err(Self::Error::from_eth_err)?
+                    .into_result();
                 drop(executor);
                 f(tx_info, res, db)
             })
@@ -732,8 +735,11 @@ pub trait Call:
     ///
     /// This executes on a caller provided EVM, so the target transaction can then be run on the
     /// same EVM, keeping any block-scoped EVM state intact. The EVM's inspector configuration is
-    /// left untouched; see
-    /// [`Trace::inspect_transaction_in_block`] to replay without inspection and trace the target.
+    /// left untouched.
+    ///
+    /// This bypasses the block executor, so it misses any chain-specific per-transaction
+    /// settlement the executor applies. To replay a block's own transactions, use
+    /// [`Trace::replay_block_until`] or [`Trace::inspect_transaction_in_block`] instead.
     ///
     /// If the target index is greater than or equal to the iterator length, all transactions are
     /// replayed.
