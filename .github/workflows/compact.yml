@@ -59,4 +59,8 @@ jobs:
           persist-credentials: false
       # On incoming merge try to read and decode previously generated vectors with `Compact`
       - name: Read vectors
+        env:
+          # act restores the head with source mtimes older than the base build's artifacts.
+          # Keep the builds separate so Cargo cannot reuse libraries from the comparison base.
+          CARGO_TARGET_DIR: target/compact-head
         run: ${{ matrix.bin }} -- test-vectors compact --read
