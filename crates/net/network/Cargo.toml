@@ -41,7 +41,7 @@ alloy-consensus.workspace = true
 alloy-eips.workspace = true
 alloy-primitives.workspace = true
 alloy-rlp = { workspace = true, features = ["derive"] }
-enr = { workspace = true, features = ["serde", "rust-secp256k1"] }
+enr = { workspace = true, features = ["serde", "rust-secp256k1", "k256"] }
 discv5.workspace = true
 
 # reth-ethereum

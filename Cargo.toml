@@ -556,7 +556,11 @@ tower = "0.5"
 tower-http = "0.6"
 
 # p2p
-discv5 = { git = "https://github.com/sigp/discv5", rev = "7663c00" }
+discv5 = "0.12.0"
+# discv5 no longer re-exports these; keep them on the versions discv5 uses
+discv5-enr = { package = "enr", version = "0.14", default-features = false, features = ["k256"] }
+libp2p-identity = { version = "0.3", default-features = false, features = ["secp256k1", "peerid"] }
+multiaddr = { version = "0.19", default-features = false }
 if-addrs = "0.14"
 
 # rpc

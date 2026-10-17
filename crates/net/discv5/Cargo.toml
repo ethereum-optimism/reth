@@ -22,7 +22,10 @@ reth-network-peers = { workspace = true, features = ["secp256k1"] }
 alloy-primitives.workspace = true
 alloy-rlp.workspace = true
 discv5 = { workspace = true, features = ["libp2p"] }
+discv5-enr.workspace = true
 enr.workspace = true
+libp2p-identity.workspace = true
+multiaddr.workspace = true
 secp256k1.workspace = true
 
 # async/futures
