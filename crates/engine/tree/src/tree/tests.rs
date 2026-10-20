@@ -23,7 +23,9 @@ use alloy_rpc_types_engine::{
 use assert_matches::assert_matches;
 use reth_chain_state::test_utils::TestBlockBuilder;
 use reth_chainspec::{ChainSpec, HOLESKY, MAINNET};
-use reth_engine_primitives::{EngineApiValidator, ForkchoiceStatus, NoopInvalidBlockHook};
+use reth_engine_primitives::{
+    BeaconForkChoiceUpdateError, EngineApiValidator, ForkchoiceStatus, NoopInvalidBlockHook,
+};
 use reth_ethereum_consensus::EthBeaconConsensus;
 use reth_ethereum_engine_primitives::{EthEngineTypes, EthPayloadAttributes};
 use reth_ethereum_primitives::{Block, EthPrimitives};
@@ -1812,7 +1814,10 @@ async fn test_fcu_with_canonical_ancestor_below_finalized_is_rejected() {
             .await
             .unwrap_err();
 
-        assert_matches!(err, ForkchoiceUpdateError::TooDeepReorg);
+        assert_matches!(
+            err,
+            BeaconForkChoiceUpdateError::ForkchoiceUpdateError(ForkchoiceUpdateError::TooDeepReorg)
+        );
     }
 
     // no payload build is started and the canonical head remains untouched
