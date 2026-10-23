@@ -1,6 +1,6 @@
 use alloy_consensus::{constants::KECCAK_EMPTY, transaction::TxHashRef, BlockHeader};
 use alloy_eips::{eip2718::Encodable2718, BlockId, BlockNumberOrTag};
-use alloy_evm::{env::BlockEnvironment, Evm};
+use alloy_evm::env::BlockEnvironment;
 use alloy_genesis::ChainConfig;
 use alloy_primitives::{hex::decode, uint, Address, Bytes, B256, U256, U64};
 use alloy_rlp::{Decodable, Encodable};
@@ -29,7 +29,7 @@ use reth_rpc_api::DebugApiServer;
 use reth_rpc_convert::RpcTxReq;
 use reth_rpc_eth_api::{
     helpers::{EthTransactions, TraceExt},
-    AsEthApiError, FromEthApiError, FromEvmError, RpcConvert, RpcNodeCore,
+    AsEthApiError, FromEthApiError, RpcConvert, RpcNodeCore,
 };
 use reth_rpc_eth_types::{EthApiError, StateCacheDb};
 use reth_rpc_server_types::{result::internal_rpc_err, ToRpcResult};
@@ -44,7 +44,7 @@ use reth_trie_common::{
     root::storage_root_unsorted, updates::TrieUpdates, ExecutionWitnessMode, HashedPostState,
     HashedStorage,
 };
-use revm::{database::states::bundle_state::BundleRetention, Database, DatabaseCommit};
+use revm::{Database, DatabaseCommit};
 use revm_inspectors::tracing::{DebugInspector, TransactionContext};
 use serde::{Deserialize, Serialize};
 use std::{collections::VecDeque, sync::Arc};
@@ -122,46 +122,7 @@ where
     ) -> Result<Vec<TraceResult>, Eth::Error> {
         self.eth_api()
             .spawn_with_state_at_block(block.parent_hash(), move |eth_api, mut db| {
-                let mut results = Vec::with_capacity(block.body().transactions().len());
-
-                eth_api.apply_pre_execution_changes(&block, &mut db)?;
-
-                let block_env = evm_env.block_env.clone();
-
-                let mut transactions = block.transactions_recovered().enumerate().peekable();
-                let inspector = DebugInspector::new(opts).map_err(Eth::Error::from_eth_err)?;
-                let mut evm =
-                    eth_api.evm_config().evm_with_env_and_inspector(&mut db, evm_env, inspector);
-                while let Some((index, tx)) = transactions.next() {
-                    let tx_env = eth_api.evm_config().tx_env(tx);
-
-                    let res = evm.transact(tx_env.clone()).map_err(Eth::Error::from_evm_err)?;
-
-                    let (db, inspector, _) = evm.components_mut();
-                    let result = inspector
-                        .get_result(
-                            Some(TransactionContext {
-                                block_hash: Some(block.hash()),
-                                tx_hash: Some(*tx.tx_hash()),
-                                tx_index: Some(index),
-                            }),
-                            &tx_env,
-                            &block_env,
-                            &res,
-                            db,
-                        )
-                        .map_err(Eth::Error::from_eth_err)?;
-
-                    results.push(TraceResult::Success { result, tx_hash: Some(*tx.tx_hash()) });
-                    if transactions.peek().is_some() {
-                        inspector.fuse().map_err(Eth::Error::from_eth_err)?;
-                        // need to apply the state changes of this transaction before executing the
-                        // next transaction
-                        db.commit(res.state)
-                    }
-                }
-
-                Ok(results)
+                eth_api.debug_trace_block_transactions(&mut db, &block, evm_env, opts)
             })
             .await
     }
@@ -177,80 +138,7 @@ where
 
         self.eth_api()
             .spawn_with_state_at_block(block.parent_hash(), move |eth_api, mut db| {
-                let tx_count = block.body().transactions().len();
-                let mut results = Vec::with_capacity(tx_count);
-
-                eth_api.apply_pre_execution_changes(&block, &mut db)?;
-
-                let block_env = evm_env.block_env.clone();
-                let mut transactions = block.transactions_recovered().enumerate().peekable();
-                let inspector = match DebugInspector::new(opts) {
-                    Ok(inspector) => inspector,
-                    Err(err) => {
-                        if let Some((_, tx)) = transactions.peek() {
-                            results.push(Some(TraceResult::Error {
-                                error: err.to_string(),
-                                tx_hash: Some(*tx.tx_hash()),
-                            }));
-                        }
-                        results.resize(tx_count, None);
-                        return Ok(results)
-                    }
-                };
-                let mut evm =
-                    eth_api.evm_config().evm_with_env_and_inspector(&mut db, evm_env, inspector);
-
-                while let Some((index, tx)) = transactions.next() {
-                    let tx_hash = *tx.tx_hash();
-                    let tx_env = eth_api.evm_config().tx_env(tx);
-                    let res = match evm.transact(tx_env.clone()) {
-                        Ok(res) => res,
-                        Err(err) => {
-                            results.push(Some(TraceResult::Error {
-                                error: err.to_string(),
-                                tx_hash: Some(tx_hash),
-                            }));
-                            break
-                        }
-                    };
-
-                    let (db, inspector, _) = evm.components_mut();
-                    let result = match inspector.get_result(
-                        Some(TransactionContext {
-                            block_hash: Some(block.hash()),
-                            tx_hash: Some(tx_hash),
-                            tx_index: Some(index),
-                        }),
-                        &tx_env,
-                        &block_env,
-                        &res,
-                        db,
-                    ) {
-                        Ok(result) => result,
-                        Err(err) => {
-                            results.push(Some(TraceResult::Error {
-                                error: err.to_string(),
-                                tx_hash: Some(tx_hash),
-                            }));
-                            break
-                        }
-                    };
-
-                    results.push(Some(TraceResult::Success { result, tx_hash: Some(tx_hash) }));
-                    if let Some((_, next_tx)) = transactions.peek() {
-                        if let Err(err) = inspector.fuse() {
-                            results.push(Some(TraceResult::Error {
-                                error: err.to_string(),
-                                tx_hash: Some(*next_tx.tx_hash()),
-                            }));
-                            break
-                        }
-                        db.commit(res.state);
-                    }
-                }
-
-                results.resize(tx_count, None);
-                Ok(results)
+                eth_api.debug_trace_chain_block_transactions(&mut db, &block, evm_env, opts)
             })
             .await
     }
@@ -814,33 +702,7 @@ where
 
         self.eth_api()
             .spawn_with_state_at_block(block.parent_hash(), move |eth_api, mut db| {
-                // Enable transition tracking so that merge_transitions works
-                db.transition_state = Some(Default::default());
-
-                eth_api.apply_pre_execution_changes(&block, &mut db)?;
-
-                let mut roots = Vec::with_capacity(block.body().transactions().len());
-                let mut evm = eth_api.evm_config().evm_with_env(&mut db, evm_env);
-                for tx in block.transactions_recovered() {
-                    let tx_env = eth_api.evm_config().tx_env(tx);
-                    evm.transact_commit(tx_env).map_err(Eth::Error::from_evm_err)?;
-
-                    let state = evm.db_mut();
-                    // Merge transitions into cumulative bundle_state
-                    state.merge_transitions(BundleRetention::PlainState);
-                    // Compute state root from the accumulated state changes
-                    let hashed_state = state
-                        .database
-                        .hashed_post_state(&state.bundle_state)
-                        .map_err(Eth::Error::from_eth_err)?;
-                    let root = state
-                        .database
-                        .state_root(hashed_state)
-                        .map_err(Eth::Error::from_eth_err)?;
-                    roots.push(root);
-                }
-
-                Ok(roots)
+                eth_api.block_intermediate_roots(&mut db, &block, evm_env)
             })
             .await
     }
