@@ -6,17 +6,26 @@ use alloy_consensus::{transaction::TxHashRef, BlockHeader};
 use alloy_eip7928::bal::DecodedBal;
 use alloy_primitives::B256;
 use alloy_rpc_types_eth::{BlockId, TransactionInfo};
+use alloy_rpc_types_trace::geth::{GethDebugTracingOptions, TraceResult};
 use futures::Future;
 use reth_errors::RethError;
 use reth_evm::{
-    block::BlockExecutor, evm::EvmFactoryExt, tracing::TracingCtx, ConfigureEvm, Evm, EvmEnvFor,
-    EvmFor, HaltReasonFor, InspectorFor, IntoTxEnv, TxEnvFor,
+    block::BlockExecutor, ConfigureEvm, Evm, EvmEnvFor, EvmFor, HaltReasonFor, InspectorFor,
+    IntoTxEnv, TxEnvFor,
 };
 use reth_primitives_traits::{BlockBody, BlockTy, Recovered, RecoveredBlock};
 use reth_rpc_eth_types::cache::db::{attach_bal_before_tx, StateCacheDb};
-use reth_storage_api::{ProviderBlock, ProviderTx};
-use revm::{context::Block, context_interface::result::ResultAndState, state::bal::Bal as RevmBal};
-use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
+use reth_storage_api::{HashedPostStateProvider, ProviderBlock, ProviderTx, StateRootProvider};
+use revm::{
+    context::Block,
+    context_interface::result::{ExecutionResult, ResultAndState},
+    database::states::bundle_state::BundleRetention,
+    state::{bal::Bal as RevmBal, EvmState},
+    DatabaseCommit,
+};
+use revm_inspectors::tracing::{
+    DebugInspector, TracingInspector, TracingInspectorConfig, TransactionContext,
+};
 use std::sync::Arc;
 
 /// Executes CPU heavy tasks.
@@ -293,14 +302,6 @@ pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> + Call {
             // we need to get the state of the parent block because we're replaying this block
             // on top of its parent block's state
             self.spawn_with_state_at_block(block.parent_hash(), move |this, mut db| {
-                let block_hash = block.hash();
-
-                let block_number = evm_env.block_env.number().saturating_to();
-                let block_timestamp = evm_env.block_env.timestamp().saturating_to();
-                let base_fee = evm_env.block_env.basefee();
-
-                this.apply_pre_execution_changes(&block, &mut db)?;
-
                 // prepare transactions, we do everything upfront to reduce time spent with open
                 // state
                 let max_transactions = highest_index.map_or_else(
@@ -311,28 +312,15 @@ pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> + Call {
                     },
                 );
 
-                let mut idx = 0;
-
-                let results = this
-                    .evm_config()
-                    .evm_factory()
-                    .create_tracer(&mut db, evm_env, inspector_setup())
-                    .try_trace_many(block.transactions_recovered().take(max_transactions), |ctx| {
-                        let tx_info = TransactionInfo {
-                            hash: Some(*ctx.tx.tx_hash()),
-                            index: Some(idx),
-                            block_hash: Some(block_hash),
-                            block_number: Some(block_number),
-                            block_timestamp: Some(block_timestamp),
-                            base_fee: Some(base_fee),
-                        };
-                        idx += 1;
-
-                        f(tx_info, ctx)
-                    })
-                    .collect::<Result<_, _>>()?;
-
-                Ok(Some(results))
+                this.trace_block_transactions(
+                    &mut db,
+                    &block,
+                    evm_env,
+                    max_transactions,
+                    inspector_setup(),
+                    f,
+                )
+                .map(Some)
             })
             .await
         }
@@ -433,5 +421,297 @@ pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> + Call {
             .apply_pre_execution_changes()
             .map_err(Self::Error::from_eth_err)?;
         Ok(())
+    }
+
+    /// Executes the first `max_transactions` transactions of `block` on `db`, which holds the
+    /// state of the block's parent, and invokes `f` with each transaction's [`TracingCtx`].
+    ///
+    /// Backs [`Trace::trace_block_until_with_inspector`]. Iteration stops at the first transaction
+    /// that fails to execute, and the state of the last executed transaction is not committed.
+    fn trace_block_transactions<Insp, F, R>(
+        &self,
+        db: &mut StateCacheDb,
+        block: &RecoveredBlock<ProviderBlock<Self::Provider>>,
+        evm_env: EvmEnvFor<Self::Evm>,
+        max_transactions: usize,
+        inspector: Insp,
+        f: F,
+    ) -> Result<Vec<R>, Self::Error>
+    where
+        F: Fn(
+            TransactionInfo,
+            TracingCtx<
+                '_,
+                Recovered<&ProviderTx<Self::Provider>>,
+                EvmFor<Self::Evm, &mut StateCacheDb, Insp>,
+            >,
+        ) -> Result<R, Self::Error>,
+        Insp: Clone + for<'a> InspectorFor<Self::Evm, &'a mut StateCacheDb>,
+    {
+        let block_hash = block.hash();
+        let block_number = evm_env.block_env.number().saturating_to();
+        let block_timestamp = evm_env.block_env.timestamp().saturating_to();
+        let base_fee = evm_env.block_env.basefee();
+
+        self.apply_pre_execution_changes(block, db)?;
+
+        let fused_inspector = inspector.clone();
+        let mut evm = self.evm_config().evm_with_env_and_inspector(db, evm_env, inspector);
+        let mut results = Vec::with_capacity(max_transactions);
+        let mut transactions =
+            block.transactions_recovered().take(max_transactions).enumerate().peekable();
+        while let Some((idx, tx)) = transactions.next() {
+            let Ok(ResultAndState { result, state }) = evm.transact(tx) else { break };
+
+            let tx_info = TransactionInfo {
+                hash: Some(*tx.tx_hash()),
+                index: Some(idx as u64),
+                block_hash: Some(block_hash),
+                block_number: Some(block_number),
+                block_timestamp: Some(block_timestamp),
+                base_fee: Some(base_fee),
+            };
+            let mut was_fused = false;
+            let (db, inspector, _) = evm.components_mut();
+            let output = f(
+                tx_info,
+                TracingCtx::new(
+                    tx,
+                    &result,
+                    &state,
+                    &mut *inspector,
+                    &mut *db,
+                    &fused_inspector,
+                    &mut was_fused,
+                ),
+            );
+            if transactions.peek().is_some() {
+                db.commit(state);
+            }
+            if !was_fused {
+                *inspector = fused_inspector.clone();
+            }
+            results.push(output?);
+        }
+        Ok(results)
+    }
+
+    /// Traces every transaction of `block` with a [`DebugInspector`] configured by `opts`, on `db`,
+    /// which holds the state of the block's parent.
+    ///
+    /// Backs `debug_traceBlockByHash`, `debug_traceBlockByNumber`, `debug_traceBlock` and
+    /// `debug_traceBadBlock`.
+    fn debug_trace_block_transactions(
+        &self,
+        db: &mut StateCacheDb,
+        block: &RecoveredBlock<ProviderBlock<Self::Provider>>,
+        evm_env: EvmEnvFor<Self::Evm>,
+        opts: GethDebugTracingOptions,
+    ) -> Result<Vec<TraceResult>, Self::Error> {
+        let mut results = Vec::with_capacity(block.body().transactions().len());
+
+        self.apply_pre_execution_changes(block, db)?;
+
+        let block_env = evm_env.block_env.clone();
+
+        let mut transactions = block.transactions_recovered().enumerate().peekable();
+        let inspector = DebugInspector::new(opts).map_err(Self::Error::from_eth_err)?;
+        let mut evm = self.evm_config().evm_with_env_and_inspector(db, evm_env, inspector);
+        while let Some((index, tx)) = transactions.next() {
+            let tx_env = self.evm_config().tx_env(tx);
+
+            let res = evm.transact(tx_env.clone()).map_err(Self::Error::from_evm_err)?;
+
+            let (db, inspector, _) = evm.components_mut();
+            let result = inspector
+                .get_result(
+                    Some(TransactionContext {
+                        block_hash: Some(block.hash()),
+                        tx_hash: Some(*tx.tx_hash()),
+                        tx_index: Some(index),
+                    }),
+                    &tx_env,
+                    &block_env,
+                    &res,
+                    db,
+                )
+                .map_err(Self::Error::from_eth_err)?;
+
+            results.push(TraceResult::Success { result, tx_hash: Some(*tx.tx_hash()) });
+            if transactions.peek().is_some() {
+                inspector.fuse().map_err(Self::Error::from_eth_err)?;
+                // need to apply the state changes of this transaction before executing the
+                // next transaction
+                db.commit(res.state)
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Traces every transaction of `block` like [`Trace::debug_trace_block_transactions`], for
+    /// `debug_traceChain`: a transaction that fails to trace is reported as a
+    /// [`TraceResult::Error`] and ends the block, and the transactions after it are `None`.
+    fn debug_trace_chain_block_transactions(
+        &self,
+        db: &mut StateCacheDb,
+        block: &RecoveredBlock<ProviderBlock<Self::Provider>>,
+        evm_env: EvmEnvFor<Self::Evm>,
+        opts: GethDebugTracingOptions,
+    ) -> Result<Vec<Option<TraceResult>>, Self::Error> {
+        let tx_count = block.body().transactions().len();
+        let mut results = Vec::with_capacity(tx_count);
+
+        self.apply_pre_execution_changes(block, db)?;
+
+        let block_env = evm_env.block_env.clone();
+        let mut transactions = block.transactions_recovered().enumerate().peekable();
+        let inspector = match DebugInspector::new(opts) {
+            Ok(inspector) => inspector,
+            Err(err) => {
+                if let Some((_, tx)) = transactions.peek() {
+                    results.push(Some(TraceResult::Error {
+                        error: err.to_string(),
+                        tx_hash: Some(*tx.tx_hash()),
+                    }));
+                }
+                results.resize(tx_count, None);
+                return Ok(results)
+            }
+        };
+        let mut evm = self.evm_config().evm_with_env_and_inspector(db, evm_env, inspector);
+
+        while let Some((index, tx)) = transactions.next() {
+            let tx_hash = *tx.tx_hash();
+            let tx_env = self.evm_config().tx_env(tx);
+            let res = match evm.transact(tx_env.clone()) {
+                Ok(res) => res,
+                Err(err) => {
+                    results.push(Some(TraceResult::Error {
+                        error: err.to_string(),
+                        tx_hash: Some(tx_hash),
+                    }));
+                    break
+                }
+            };
+
+            let (db, inspector, _) = evm.components_mut();
+            let result = match inspector.get_result(
+                Some(TransactionContext {
+                    block_hash: Some(block.hash()),
+                    tx_hash: Some(tx_hash),
+                    tx_index: Some(index),
+                }),
+                &tx_env,
+                &block_env,
+                &res,
+                db,
+            ) {
+                Ok(result) => result,
+                Err(err) => {
+                    results.push(Some(TraceResult::Error {
+                        error: err.to_string(),
+                        tx_hash: Some(tx_hash),
+                    }));
+                    break
+                }
+            };
+
+            results.push(Some(TraceResult::Success { result, tx_hash: Some(tx_hash) }));
+            if let Some((_, next_tx)) = transactions.peek() {
+                if let Err(err) = inspector.fuse() {
+                    results.push(Some(TraceResult::Error {
+                        error: err.to_string(),
+                        tx_hash: Some(*next_tx.tx_hash()),
+                    }));
+                    break
+                }
+                db.commit(res.state);
+            }
+        }
+
+        results.resize(tx_count, None);
+        Ok(results)
+    }
+
+    /// Executes every transaction of `block` on `db`, which holds the state of the block's
+    /// parent, and returns the state root after each one.
+    ///
+    /// Backs `debug_intermediateRoots`.
+    fn block_intermediate_roots(
+        &self,
+        db: &mut StateCacheDb,
+        block: &RecoveredBlock<ProviderBlock<Self::Provider>>,
+        evm_env: EvmEnvFor<Self::Evm>,
+    ) -> Result<Vec<B256>, Self::Error> {
+        // Enable transition tracking so that merge_transitions works
+        db.transition_state = Some(Default::default());
+
+        self.apply_pre_execution_changes(block, db)?;
+
+        let mut roots = Vec::with_capacity(block.body().transactions().len());
+        let mut evm = self.evm_config().evm_with_env(db, evm_env);
+        for tx in block.transactions_recovered() {
+            let tx_env = self.evm_config().tx_env(tx);
+            evm.transact_commit(tx_env).map_err(Self::Error::from_evm_err)?;
+
+            let state = evm.db_mut();
+            // Merge transitions into cumulative bundle_state
+            state.merge_transitions(BundleRetention::PlainState);
+            // Compute state root from the accumulated state changes
+            let hashed_state = state
+                .database
+                .hashed_post_state(&state.bundle_state)
+                .map_err(Self::Error::from_eth_err)?;
+            let root =
+                state.database.state_root(hashed_state).map_err(Self::Error::from_eth_err)?;
+            roots.push(root);
+        }
+
+        Ok(roots)
+    }
+}
+
+/// Context for one transaction of a block traced by [`Trace::trace_block_transactions`].
+#[derive(Debug)]
+pub struct TracingCtx<'a, T, E: Evm> {
+    /// The transaction that was just executed.
+    pub tx: T,
+    /// Result of transaction execution.
+    pub result: &'a ExecutionResult<E::HaltReason>,
+    /// State changes after transaction.
+    pub state: &'a EvmState,
+    /// Inspector state after transaction.
+    pub inspector: &'a mut E::Inspector,
+    /// Database used when executing the transaction, _before_ committing the state changes.
+    pub db: &'a mut E::DB,
+    /// Inspector state before any transaction was executed.
+    fused_inspector: &'a E::Inspector,
+    /// Whether the inspector was already reset by [`TracingCtx::take_inspector`].
+    was_fused: &'a mut bool,
+}
+
+impl<'a, T, E: Evm> TracingCtx<'a, T, E> {
+    /// Creates the context for a transaction. `fused_inspector` is the inspector state before any
+    /// transaction was executed; `was_fused` is set when the callback takes the inspector, and the
+    /// caller resets the inspector to `fused_inspector` otherwise.
+    pub const fn new(
+        tx: T,
+        result: &'a ExecutionResult<E::HaltReason>,
+        state: &'a EvmState,
+        inspector: &'a mut E::Inspector,
+        db: &'a mut E::DB,
+        fused_inspector: &'a E::Inspector,
+        was_fused: &'a mut bool,
+    ) -> Self {
+        Self { tx, result, state, inspector, db, fused_inspector, was_fused }
+    }
+}
+
+impl<T, E: Evm<Inspector: Clone>> TracingCtx<'_, T, E> {
+    /// Returns the inspector state of this transaction, resetting the inspector for the next one.
+    pub fn take_inspector(&mut self) -> E::Inspector {
+        *self.was_fused = true;
+        core::mem::replace(self.inspector, self.fused_inspector.clone())
     }
 }

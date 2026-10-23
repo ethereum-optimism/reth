@@ -565,7 +565,7 @@ where
                     let mut full_trace = ctx
                         .take_inspector()
                         .into_parity_builder()
-                        .into_trace_results(&ctx.result, &trace_types);
+                        .into_trace_results(ctx.result, &trace_types);
 
                     // If statediffs were requested, populate them with the account balance and
                     // nonce from pre-state

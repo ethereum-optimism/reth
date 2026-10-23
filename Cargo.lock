@@ -10268,6 +10268,7 @@ dependencies = [
  "alloy-rlp",
  "alloy-rpc-types-eth",
  "alloy-rpc-types-mev",
+ "alloy-rpc-types-trace",
  "alloy-serde",
  "async-trait",
  "auto_impl",
