@@ -44,6 +44,7 @@ alloy-network.workspace = true
 alloy-primitives.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-rpc-types-mev.workspace = true
+alloy-rpc-types-trace.workspace = true
 alloy-consensus.workspace = true
 
 # rpc
@@ -61,6 +62,9 @@ auto_impl.workspace = true
 dyn-clone.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true
 
 [features]
 js-tracer = ["revm-inspectors/js-tracer", "reth-rpc-eth-types/js-tracer"]
