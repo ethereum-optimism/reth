@@ -8,7 +8,7 @@ version = "0.0.0"
 [workspace]
 
 [dev-dependencies]
-new-compressors = { package = "reth-zstd-compressors", path = "../../../vendor/reth-zstd-compressors" }
+new-compressors = { git = "https://github.com/ethereum-optimism/reth-core", package = "reth-zstd-compressors", rev = "46719f79ff5f1b94bae3738cd65a4e44774b8e09" }
 new-zstd = { package = "zstd", version = "=0.14.3" }
 old-compressors = { package = "reth-zstd-compressors", version = "=0.7.1" }
 old-zstd = { package = "zstd", version = "=0.13.3" }

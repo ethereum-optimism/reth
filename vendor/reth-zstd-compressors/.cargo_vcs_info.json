@@ -1,6 +1,0 @@
-{
-  "git": {
-    "sha1": "7980707115539d412455beacd4c9577b67baf850"
-  },
-  "path_in_vcs": "crates/zstd-compressors"
-}
