@@ -222,8 +222,8 @@ checksum = "ba39f3699c378cd8970968dcbff9c43159ea4cfbd88d43c00b22f2ef10a435d2"
 name = "reth-compression-compatibility-tests"
 version = "0.0.0"
 dependencies = [
- "reth-zstd-compressors 0.7.1",
  "reth-zstd-compressors 0.7.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-zstd-compressors 0.7.1 (git+https://github.com/ethereum-optimism/reth-core?rev=46719f79ff5f1b94bae3738cd65a4e44774b8e09)",
  "rstest",
  "zstd 0.13.3",
  "zstd 0.14.3",
@@ -233,17 +233,18 @@ dependencies = [
 [[package]]
 name = "reth-zstd-compressors"
 version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbdee2f0ad09dc32b43ab52641f8239766a66de4345834bad27d5cfa2f62864d"
 dependencies = [
- "zstd 0.14.3",
+ "zstd 0.13.3",
 ]
 
 [[package]]
 name = "reth-zstd-compressors"
 version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbdee2f0ad09dc32b43ab52641f8239766a66de4345834bad27d5cfa2f62864d"
+source = "git+https://github.com/ethereum-optimism/reth-core?rev=46719f79ff5f1b94bae3738cd65a4e44774b8e09#46719f79ff5f1b94bae3738cd65a4e44774b8e09"
 dependencies = [
- "zstd 0.13.3",
+ "zstd 0.14.3",
 ]
 
 [[package]]
