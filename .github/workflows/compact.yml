@@ -41,28 +41,18 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
-      # An `op-v<version>` branch builds on upstream tag `v<version>`. Pushes to it must decode
-      # that release's data, not unreleased main formats.
+      - name: Test compact workflow helpers
+        run: python3 .github/scripts/test_compact_workflow.py
       - name: Select base
         id: base
         env:
           BASE_REF: ${{ github.base_ref }}
           REF: ${{ github.ref }}
+          REPOSITORY: ${{ github.repository }}
         run: |
-          set -euo pipefail
-          if [ -n "$BASE_REF" ]; then
-            base="$BASE_REF"
-          else
-            case "$REF" in
-              refs/heads/op-v*) base="${REF#refs/heads/op-}" ;;
-              refs/heads/op-*)
-                echo "no compact base for ${REF}: only op-v<version> branches map to an upstream tag" >&2
-                exit 1
-                ;;
-              *) base=main ;;
-            esac
-          fi
-          echo "ref=$base" >> "$GITHUB_OUTPUT"
+          comparison_base="$(bash .github/scripts/compact-base.sh)"
+          printf 'ref=%s\n' "$comparison_base" >> "$GITHUB_OUTPUT"
+          cp .github/scripts/compact-clean-source.sh "$RUNNER_TEMP/compact-clean-source.sh"
       - name: Checkout base
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -72,6 +62,8 @@ jobs:
       - name: Generate compact vectors
         run: |
           ${{ matrix.bin }} -- test-vectors compact --write
+      - name: Remove comparison source files
+        run: bash "$RUNNER_TEMP/compact-clean-source.sh"
       - name: Checkout PR
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
