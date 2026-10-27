@@ -1,0 +1,4 @@
+Source: published reth-zstd-compressors 0.7.1 from paradigmxyz/reth-core.
+The Rust source and both compression dictionaries are unchanged.
+The manifest selects zstd 0.14.3, matching upstream reth-core PR 74.
+This compatibility backport retains the 0.7 API for reth-codecs consumers.

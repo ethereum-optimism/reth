@@ -152,7 +152,7 @@ members = [
     "crates/tracing-otlp",
 ]
 default-members = ["bin/reth"]
-exclude = ["docs/cli"]
+exclude = [".github/compatibility/compression", "docs/cli", "vendor/reth-zstd-compressors"]
 
 # Explicitly set the resolver to version 2, which is the default for packages with edition >= 2021
 # https://doc.rust-lang.org/edition-guide/rust-2021/default-cargo-resolver.html
@@ -521,7 +521,7 @@ tar = "0.4.46"
 tracing = { version = "0.1.0", default-features = false, features = ["attributes"] }
 tracing-appender = "0.2.5"
 url = { version = "2.3", default-features = false }
-zstd = "0.13"
+zstd = "0.14.3"
 byteorder = "1"
 fixed-cache = { version = "0.1.10", default-features = false, features = ["alloc"] }
 moka = "0.12"
@@ -661,3 +661,6 @@ vergen-git2 = "10.0.1"
 
 # networking
 ipnet = "2.11"
+
+[patch.crates-io]
+reth-zstd-compressors = { path = "vendor/reth-zstd-compressors" }
