@@ -1,9 +1,10 @@
 //! Loads chain metadata.
 
+use alloy_consensus::BlockHeader;
 use alloy_primitives::{U256, U64};
 use alloy_rpc_types_eth::{Stage, SyncInfo, SyncStatus};
 use futures::Future;
-use reth_chainspec::ChainInfo;
+use reth_chainspec::{ChainInfo, ChainSpecProvider, EthChainSpec};
 use reth_errors::{RethError, RethResult};
 use reth_network_api::NetworkInfo;
 use reth_prune_types::{PruneMode, PruneSegment};
@@ -54,20 +55,29 @@ pub trait EthApiSpec: RpcNodeCore + EthApiTypes {
     {
         let chain_info = self.chain_info()?;
         let provider = self.provider();
+        let genesis_block = provider.chain_spec().genesis_header().number();
 
         let state = effective_resource(
             provider,
+            genesis_block,
             &[PruneSegment::AccountHistory, PruneSegment::StorageHistory],
         )?;
-        let tx =
-            effective_resource(provider, &[PruneSegment::TransactionLookup, PruneSegment::Bodies])?;
-        let logs =
-            effective_resource(provider, &[PruneSegment::Receipts, PruneSegment::ContractLogs])?;
+        let tx = effective_resource(
+            provider,
+            genesis_block,
+            &[PruneSegment::TransactionLookup, PruneSegment::Bodies],
+        )?;
+        let logs = effective_resource(
+            provider,
+            genesis_block,
+            &[PruneSegment::Receipts, PruneSegment::ContractLogs],
+        )?;
         let receipts = effective_resource(
             provider,
+            genesis_block,
             &[PruneSegment::Receipts, PruneSegment::TransactionLookup, PruneSegment::Bodies],
         )?;
-        let blocks = effective_resource(provider, &[PruneSegment::Bodies])?;
+        let blocks = effective_resource(provider, genesis_block, &[PruneSegment::Bodies])?;
 
         let proof_window = self.max_proof_window();
         let proof_oldest = chain_info
@@ -129,7 +139,8 @@ pub trait EthApiSpec: RpcNodeCore + EthApiTypes {
 /// all storage segments needed to serve it.
 ///
 /// A resource is only available where every required segment is available, so the oldest available
-/// block is the maximum pruned checkpoint across the segments. If any segment is configured with a
+/// block is the maximum pruned checkpoint across the segments, and never below `genesis_block`: a
+/// chain whose genesis is not block 0 holds no blocks below it. If any segment is configured with a
 /// distance-based prune mode, or with full pruning that still keeps the segment minimum, expose the
 /// smallest retention window because that is the tightest limit callers can rely on. If full
 /// pruning leaves no reliable window for any required segment, the resource is disabled.
@@ -137,9 +148,10 @@ pub trait EthApiSpec: RpcNodeCore + EthApiTypes {
 /// See also: <https://github.com/ethereum/execution-apis/pull/755>
 fn effective_resource(
     provider: &impl PruneCheckpointReader,
+    genesis_block: u64,
     segments: &[PruneSegment],
 ) -> RethResult<EthCapabilitiesResource> {
-    let mut oldest_block = 0;
+    let mut oldest_block = genesis_block;
     let mut retention_blocks = None::<u64>;
     let mut disabled = false;
 
@@ -232,7 +244,8 @@ mod tests {
             },
         );
 
-        let resource = effective_resource(&provider, &[PruneSegment::TransactionLookup]).unwrap();
+        let resource =
+            effective_resource(&provider, 0, &[PruneSegment::TransactionLookup]).unwrap();
 
         assert_eq!(resource, EthCapabilitiesResource::disabled());
     }
@@ -248,11 +261,46 @@ mod tests {
             },
         );
 
-        let resource = effective_resource(&provider, &[PruneSegment::Bodies]).unwrap();
+        let resource = effective_resource(&provider, 0, &[PruneSegment::Bodies]).unwrap();
 
         assert_eq!(
             resource,
             EthCapabilitiesResource::window(11, PruneSegment::Bodies.min_blocks())
+        );
+    }
+
+    #[test]
+    fn oldest_block_starts_at_genesis() {
+        let unpruned = TestPruneCheckpointReader::default();
+        assert_eq!(
+            effective_resource(&unpruned, 100, &[PruneSegment::Bodies]).unwrap(),
+            EthCapabilitiesResource::available_from(100)
+        );
+
+        let pruned_below_genesis = TestPruneCheckpointReader::with_checkpoint(
+            PruneSegment::Bodies,
+            PruneCheckpoint {
+                block_number: Some(10),
+                tx_number: None,
+                prune_mode: PruneMode::Before(11),
+            },
+        );
+        assert_eq!(
+            effective_resource(&pruned_below_genesis, 100, &[PruneSegment::Bodies]).unwrap(),
+            EthCapabilitiesResource::available_from(100)
+        );
+
+        let pruned_above_genesis = TestPruneCheckpointReader::with_checkpoint(
+            PruneSegment::Bodies,
+            PruneCheckpoint {
+                block_number: Some(200),
+                tx_number: None,
+                prune_mode: PruneMode::Before(201),
+            },
+        );
+        assert_eq!(
+            effective_resource(&pruned_above_genesis, 100, &[PruneSegment::Bodies]).unwrap(),
+            EthCapabilitiesResource::available_from(201)
         );
     }
 }
