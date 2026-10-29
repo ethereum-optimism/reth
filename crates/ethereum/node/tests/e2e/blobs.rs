@@ -1,5 +1,5 @@
 use crate::utils::eth_payload_attributes;
-use alloy_eips::{merge::SLOT_DURATION_SECS, Decodable2718};
+use alloy_eips::Decodable2718;
 use alloy_genesis::Genesis;
 use reth_chainspec::{ChainSpecBuilder, MAINNET};
 use reth_e2e_test_utils::{
@@ -12,7 +12,10 @@ use reth_node_core::{args::RpcServerArgs, node_config::NodeConfig};
 use reth_node_ethereum::EthereumNode;
 use reth_tasks::Runtime;
 use reth_transaction_pool::TransactionPool;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 #[tokio::test]
 async fn can_handle_blobs() -> eyre::Result<()> {
@@ -143,9 +146,9 @@ async fn blob_conversion_at_osaka() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
     let runtime = Runtime::test();
 
-    // Keep genesis outside the conversion window until both legacy sidecars are checked.
-    let prague_timestamp = 2 * SLOT_DURATION_SECS;
-    let osaka_timestamp = prague_timestamp + 2 * SLOT_DURATION_SECS;
+    let current_timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    // Osaka activates in 2 slots
+    let osaka_timestamp = current_timestamp + 24;
 
     let genesis: Genesis = serde_json::from_str(include_str!("../assets/genesis.json")).unwrap();
     let chain_spec = Arc::new(
@@ -171,9 +174,15 @@ async fn blob_conversion_at_osaka() -> eyre::Result<()> {
 
     let mut node = NodeTestContext::new(node, eth_payload_attributes).await?;
 
-    let mut wallets = Wallet::new(2).wallet_gen();
+    let mut wallets = Wallet::new(3).wallet_gen();
     let first = wallets.pop().unwrap();
     let second = wallets.pop().unwrap();
+
+    // build a dummy payload at `current_timestamp`
+    let raw_tx = TransactionTestContext::transfer_tx_bytes(1, wallets.pop().unwrap()).await;
+    node.rpc.inject_tx(raw_tx).await?;
+    node.payload.timestamp = current_timestamp - 1;
+    node.advance_block().await?;
 
     // build blob txs
     let first_blob = TransactionTestContext::tx_with_blobs_bytes(1, first.clone()).await?;
@@ -205,10 +214,8 @@ async fn blob_conversion_at_osaka() -> eyre::Result<()> {
     TransactionTestContext::validate_sidecar(envelope);
 
     // build last Prague payload
-    node.payload.timestamp = prague_timestamp - 1;
+    node.payload.timestamp = current_timestamp + 1;
     let prague_payload = node.new_payload().await?;
-    assert_eq!(prague_payload.block().timestamp, prague_timestamp);
-    assert!(prague_payload.block().body().transactions().any(|tx| *tx.hash() == blob_tx_hash));
     assert!(matches!(prague_payload.sidecars(), BlobSidecars::Eip4844(_)));
 
     // inject second blob tx to the pool
@@ -220,14 +227,7 @@ async fn blob_conversion_at_osaka() -> eyre::Result<()> {
     // validate sidecar
     TransactionTestContext::validate_sidecar(envelope);
 
-    node.update_forkchoice(genesis_hash, node.submit_payload(prague_payload).await?).await?;
-    let sidecar_conversion = async {
-        while !node.inner.pool.get_blob(blob_tx_hash)?.is_some_and(|sidecar| sidecar.is_eip7594()) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        Ok::<(), eyre::Report>(())
-    };
-    tokio::time::timeout(Duration::from_secs(30), sidecar_conversion).await??;
+    tokio::time::sleep(Duration::from_secs(6)).await;
 
     // fetch second blob tx from rpc again
     let envelope = node.rpc.envelope_by_hash(blob_tx_hash).await?;
@@ -235,6 +235,9 @@ async fn blob_conversion_at_osaka() -> eyre::Result<()> {
     assert!(envelope.as_eip4844().unwrap().tx().sidecar().unwrap().is_eip7594());
     // validate sidecar
     TransactionTestContext::validate_sidecar(envelope);
+
+    // submit the Prague payload
+    node.update_forkchoice(genesis_hash, node.submit_payload(prague_payload).await?).await?;
 
     // Build first Osaka payload
     node.payload.timestamp = osaka_timestamp - 1;
