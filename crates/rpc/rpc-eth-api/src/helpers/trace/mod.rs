@@ -30,6 +30,9 @@ use std::sync::Arc;
 
 mod replay;
 
+#[cfg(test)]
+mod replay_tests;
+
 /// Executes CPU heavy tasks.
 pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> + Call {
     /// Executes the [`TxEnvFor`] with [`reth_evm::EvmEnv`] against the given [`StateCacheDb`]
