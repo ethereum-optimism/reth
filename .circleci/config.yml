@@ -45,6 +45,23 @@ jobs:
           name: cargo deny check
           command: cargo deny --log-level warn --all-features check all
 
+  compression-compatibility:
+    docker:
+      - image: rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
+    resource_class: medium
+    steps:
+      - checkout
+      - run:
+          name: Install Clippy
+          command: rustup component add clippy
+      - run:
+          name: Check compression compatibility
+          command: cargo test --locked --manifest-path .github/compatibility/compression/Cargo.toml
+      - run:
+          name: Lint compression compatibility tests
+          command: cargo clippy --locked --manifest-path .github/compatibility/compression/Cargo.toml --all-targets -- -D warnings
+
+
   prepare-act-event:
     machine:
       image: ubuntu-2404:2025.09.1
@@ -233,6 +250,7 @@ workflows:
                 - feature-propagation
       - cargo-deny:
           name: lint-deny
+      - compression-compatibility
       - act:
           wf: unit.yml
           concurrent_jobs: 1
