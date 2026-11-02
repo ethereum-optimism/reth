@@ -150,6 +150,11 @@ jobs:
               esac
             fi
 
+            act_checkout=()
+            if [ "<< parameters.wf >>" = "compact.yml" ]; then
+              act_checkout=(--no-skip-checkout)
+            fi
+
             act_env=(--env "RUSTC_WRAPPER=" --env "GITHUB_BASE_REF=${base_ref}")
             if [ "<< parameters.wf >>" = "unit.yml" ] && [ "$target_job" = "state" ]; then
               # EF tests use Rayon internally, so unrestricted nextest processes multiply
@@ -165,6 +170,7 @@ jobs:
 
             act "$event_name" -W ".github/workflows/<< parameters.wf >>" \
               "${act_job[@]}" \
+              "${act_checkout[@]}" \
               --eventpath "$event_path" \
               -P "ubuntu-latest=catthehacker/ubuntu@sha256:b839c14c4410998529ec18f951262bdf87a2b23bc1467304d07b491b9455e074" \
               --concurrent-jobs << parameters.concurrent_jobs >> \
