@@ -721,7 +721,8 @@ pub trait EthTransactions: LoadTransaction<Provider: BlockReaderIdExt> {
 pub trait LoadTransaction: SpawnBlocking + FullEthApiTypes + RpcNodeCoreExt {
     /// Returns the transaction by hash.
     ///
-    /// Checks the pool and state.
+    /// Checks the RPC cache, historical state, chain-specific pending transactions, and pool,
+    /// in that order.
     ///
     /// Returns `Ok(None)` if no matching transaction was found.
     #[expect(clippy::complexity)]
@@ -765,7 +766,11 @@ pub trait LoadTransaction: SpawnBlocking + FullEthApiTypes + RpcNodeCoreExt {
                 }));
             }
 
-            // tx not found on disk, check pool
+            if let Some(transaction) = self.transaction_by_hash_from_pending(hash).await? {
+                return Ok(Some(transaction));
+            }
+
+            // tx not found in historical or chain-specific pending state, check pool
             if let Some(tx) = self.pool().get(&hash).map(|tx| tx.transaction.clone_into_consensus())
             {
                 return Ok(Some(TransactionSource::Pool(tx.into())));
@@ -773,6 +778,23 @@ pub trait LoadTransaction: SpawnBlocking + FullEthApiTypes + RpcNodeCoreExt {
 
             Ok(None)
         }
+    }
+
+    /// Looks up a transaction in chain-specific pending state, such as preconfirmed blocks.
+    ///
+    /// [`Self::transaction_by_hash`] calls this only after the RPC cache and historical lookup
+    /// miss, and before consulting the transaction pool. Return `Ok(None)` to continue to the
+    /// pool, or an error to stop the lookup. The default has no additional pending source.
+    ///
+    /// Override this hook instead of copying the shared lookup pipeline.
+    #[expect(clippy::type_complexity)]
+    fn transaction_by_hash_from_pending(
+        &self,
+        _hash: B256,
+    ) -> impl Future<
+        Output = Result<Option<TransactionSource<ProviderTx<Self::Provider>>>, Self::Error>,
+    > + Send {
+        async { Ok(None) }
     }
 
     /// Returns the transaction by including its corresponding [`BlockId`].
