@@ -1,6 +1,6 @@
 # Ensures that `Compact` codec changes are backwards compatible.
 #
-# 1) checkout `main`
+# 1) checkout the PR base, or the upstream base of an `op-*` branch for pushes to it
 # 2) randomly generate and serialize to disk many different type vectors with `Compact` (eg. Header, Transaction, etc)
 # 3) checkout `pr`
 # 4) deserialize previously generated test vectors
@@ -39,17 +39,39 @@ jobs:
       - run: .github/scripts/install_llvm.sh ubuntu
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
-          toolchain: stable
+          toolchain: "1.97.0"
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
+      # An `op-v<version>` branch builds on upstream tag `v<version>`. Pushes to it must decode
+      # that release's data, not unreleased main formats.
+      - name: Select base
+        id: base
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "$BASE_REF" ]; then
+            base="$BASE_REF"
+          else
+            case "$REF" in
+              refs/heads/op-v*) base="${REF#refs/heads/op-}" ;;
+              refs/heads/op-*)
+                echo "no compact base for ${REF}: only op-v<version> branches map to an upstream tag" >&2
+                exit 1
+                ;;
+              *) base=main ;;
+            esac
+          fi
+          echo "ref=$base" >> "$GITHUB_OUTPUT"
       - name: Checkout base
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.base_ref || 'main' }}
+          ref: ${{ steps.base.outputs.ref }}
           persist-credentials: false
-      # On `main` branch, generates test vectors and serializes them to disk using `Compact`.
+      # On the comparison base, generate test vectors and serialize them to disk using `Compact`.
       - name: Generate compact vectors
         run: |
           ${{ matrix.bin }} -- test-vectors compact --write
@@ -60,4 +82,8 @@ jobs:
           persist-credentials: false
       # On incoming merge try to read and decode previously generated vectors with `Compact`
       - name: Read vectors
+        env:
+          # act restores the head with source mtimes older than the base build's artifacts.
+          # Keep the builds separate so Cargo cannot reuse libraries from the comparison base.
+          CARGO_TARGET_DIR: target/compact-head
         run: ${{ matrix.bin }} -- test-vectors compact --read
