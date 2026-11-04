@@ -402,7 +402,6 @@ where
                     &mut db,
                     &mut inspector,
                     index,
-                    tx_env.clone(),
                     bal.as_deref(),
                 )?;
 
@@ -763,16 +762,12 @@ where
 
         self.eth_api()
             .spawn_with_state_at_block(block.parent_hash(), move |eth_api, mut db| {
-                let mut executor = eth_api
-                    .evm_config()
-                    .executor_for_block(&mut db, block.sealed_block())
-                    .map_err(RethError::other)
-                    .map_err(Eth::Error::from_eth_err)?;
-                executor.apply_pre_execution_changes().map_err(Eth::Error::from_eth_err)?;
-
-                for tx in block.transactions_recovered().take(tx_index + 1) {
-                    executor.execute_transaction(tx).map_err(Eth::Error::from_eth_err)?;
-                }
+                let mut executor = eth_api.block_executor(&block, &mut db)?;
+                eth_api.replay_transactions_until_with_executor(
+                    &mut executor,
+                    block.transactions_recovered(),
+                    tx_index + 1,
+                )?;
                 drop(executor);
 
                 f(&mut db)
@@ -878,12 +873,7 @@ where
                 // Enable transition tracking so that merge_transitions works
                 db.transition_state = Some(Default::default());
 
-                let mut executor = eth_api
-                    .evm_config()
-                    .executor_for_block(&mut db, block.sealed_block())
-                    .map_err(RethError::other)
-                    .map_err(Eth::Error::from_eth_err)?;
-                executor.apply_pre_execution_changes().map_err(Eth::Error::from_eth_err)?;
+                let mut executor = eth_api.block_executor(&block, &mut db)?;
 
                 let mut roots = Vec::with_capacity(block.body().transactions().len());
                 for tx in block.transactions_recovered() {

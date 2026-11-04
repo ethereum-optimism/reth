@@ -12,17 +12,13 @@ use reth_evm::{
     block::{BlockExecutor, BlockExecutorFor, TxResult},
     ConfigureEvm, Evm, EvmEnvFor, EvmFor, HaltReasonFor, InspectorFor, IntoTxEnv, TxEnvFor,
 };
-use reth_primitives_traits::{BlockBody, BlockTy, Recovered, RecoveredBlock};
+use reth_primitives_traits::{BlockBody, BlockTy, RecoveredBlock};
 use reth_rpc_eth_types::{
     cache::db::{attach_bal_before_tx, StateCacheDb},
     EthApiError,
 };
-use reth_storage_api::{ProviderBlock, ProviderTx};
-use revm::{
-    context::Block,
-    context_interface::result::{ExecutionResult, ResultAndState},
-    state::{bal::Bal as RevmBal, EvmState},
-};
+use reth_storage_api::ProviderBlock;
+use revm::{context::Block, context_interface::result::ResultAndState, state::bal::Bal as RevmBal};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::sync::Arc;
 
@@ -113,7 +109,7 @@ pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> + Call {
                     None => return Ok(None),
                     Some(res) => res,
                 };
-            let (tx, tx_info) = transaction.split();
+            let (_, tx_info) = transaction.split();
 
             // we need to get the state of the parent block because we're essentially replaying the
             // block the transaction is included in
@@ -128,7 +124,6 @@ pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> + Call {
                     // returns transactions included in a block
                     tx_info.index.expect("transaction_and_block only returns block transactions")
                         as usize,
-                    tx,
                     bal.as_deref(),
                 )?;
                 f(tx_info, inspector, res, db)
@@ -160,29 +155,26 @@ pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> + Call {
             return Ok(())
         }
 
-        let mut executor = self
-            .evm_config()
-            .executor_for_block(db, block.sealed_block())
-            .map_err(RethError::other)
-            .map_err(Self::Error::from_eth_err)?;
-        executor.apply_pre_execution_changes().map_err(Self::Error::from_eth_err)?;
-
-        for tx in block.transactions_recovered().take(target_tx_index) {
-            executor.execute_transaction(tx).map_err(Self::Error::from_eth_err)?;
-        }
-        Ok(())
+        let mut executor = self.block_executor(block, db)?;
+        self.replay_transactions_until_with_executor(
+            &mut executor,
+            block.transactions_recovered(),
+            target_tx_index,
+        )
     }
 
-    /// Executes the target transaction with the configured inspector on the state right before
-    /// the transaction.
+    /// Executes the block's transaction at the target index with the configured inspector on the
+    /// state right before the transaction.
     ///
     /// If the block's cached BAL is given, the state is positioned by attaching the BAL at the
-    /// target index, see [`attach_bal_before_tx`], and `target_tx_env` is executed on its own, so
+    /// target index, see [`attach_bal_before_tx`], and the transaction is executed on its own, so
     /// per-transaction changes the block executor applies are skipped. Otherwise all transactions
-    /// before the target transaction are replayed without inspection through the block
-    /// executor, which then executes the block's transaction at the target index, so the result
+    /// before the target transaction are replayed without inspection through the block executor,
+    /// see [`Call::block_executor`], which then executes the target transaction, so the result
     /// includes any per-transaction changes the executor applies. The result is not committed
     /// to `db`.
+    ///
+    /// Returns [`EthApiError::InvalidParams`] if the block has no transaction at that index.
     #[expect(clippy::type_complexity)]
     fn inspect_transaction_in_block<'a>(
         &self,
@@ -190,32 +182,33 @@ pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> + Call {
         db: &'a mut StateCacheDb,
         inspector: impl InspectorFor<Self::Evm, &'a mut StateCacheDb>,
         target_tx_index: usize,
-        target_tx_env: impl IntoTxEnv<TxEnvFor<Self::Evm>>,
         bal: Option<&DecodedBal<Arc<RevmBal>>>,
     ) -> Result<(ResultAndState<HaltReasonFor<Self::Evm>>, EvmEnvFor<Self::Evm>), Self::Error> {
+        let Some(target_tx) = block.transactions_recovered().nth(target_tx_index) else {
+            return Err(Self::Error::from_eth_err(EthApiError::InvalidParams(format!(
+                "tx_index {target_tx_index} out of bounds for block with {} transactions",
+                block.transaction_count()
+            ))))
+        };
         let evm_env = self.evm_env_for_header(block.sealed_block().sealed_header())?;
 
         if let Some(bal) = bal {
             // the BAL also covers the block's pre-execution changes
             attach_bal_before_tx(db, bal, target_tx_index);
             let mut evm = self.evm_config().evm_with_env_and_inspector(db, evm_env, inspector);
-            let res = evm.transact(target_tx_env).map_err(Self::Error::from_evm_err)?;
+            let res = evm
+                .transact(self.evm_config().tx_env(target_tx))
+                .map_err(Self::Error::from_evm_err)?;
             let (_, evm_env) = evm.finish();
             return Ok((res, evm_env))
         }
 
         let mut executor = self.inspected_block_executor(block, db, evm_env.clone(), inspector)?;
-
-        let mut block_txs = block.transactions_recovered();
-        for tx in block_txs.by_ref().take(target_tx_index) {
-            executor.execute_transaction(tx).map_err(Self::Error::from_eth_err)?;
-        }
-        let target_tx = block_txs.next().ok_or_else(|| {
-            Self::Error::from_eth_err(EthApiError::InvalidParams(format!(
-                "tx_index {target_tx_index} out of bounds for block with {} transactions",
-                block.transaction_count()
-            )))
-        })?;
+        self.replay_transactions_until_with_executor(
+            &mut executor,
+            block.transactions_recovered(),
+            target_tx_index,
+        )?;
 
         executor.evm_mut().enable_inspector();
         let res = executor
@@ -229,9 +222,9 @@ pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> + Call {
     /// Creates a block executor for `block` whose EVM runs the given inspector, and applies the
     /// block's pre-execution changes. The inspector is left disabled.
     ///
-    /// Block transactions must be replayed through the executor rather than its EVM: the executor
-    /// tracks the transaction's position in the block and applies chain-specific per-transaction
-    /// settlement, such as OP Stack's post-execution gas refunds, that a bare EVM replay misses.
+    /// The uninspected counterpart is [`Call::block_executor`]; this one exists because the EVM
+    /// takes its inspector as a type parameter, so a tracer has to be in place when the executor
+    /// is created.
     #[expect(clippy::type_complexity, reason = "the executor type is spelled out by its factory")]
     fn inspected_block_executor<'a, 'db, I>(
         &'a self,
@@ -284,7 +277,7 @@ pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> + Call {
                 TransactionInfo,
                 TracingCtx<
                     '_,
-                    Recovered<&ProviderTx<Self::Provider>>,
+                    TracingInspector,
                     EvmFor<Self::Evm, &mut StateCacheDb, TracingInspector>,
                 >,
             ) -> Result<R, Self::Error>
@@ -323,16 +316,12 @@ pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> + Call {
         Self: LoadBlock,
         F: Fn(
                 TransactionInfo,
-                TracingCtx<
-                    '_,
-                    Recovered<&ProviderTx<Self::Provider>>,
-                    EvmFor<Self::Evm, &mut StateCacheDb, Insp>,
-                >,
+                TracingCtx<'_, Insp, EvmFor<Self::Evm, &mut StateCacheDb, Insp>>,
             ) -> Result<R, Self::Error>
             + Send
             + 'static,
         Setup: FnMut() -> Insp + Send + 'static,
-        Insp: Clone + for<'a> InspectorFor<Self::Evm, &'a mut StateCacheDb>,
+        Insp: for<'a> InspectorFor<Self::Evm, &'a mut StateCacheDb>,
         R: Send + 'static,
     {
         async move {
@@ -369,10 +358,8 @@ pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> + Call {
                     )
                     .min(block.body().transaction_count());
 
-                let inspector = inspector_setup();
-                let fused_inspector = inspector.clone();
                 let mut executor =
-                    this.inspected_block_executor(&block, &mut db, evm_env, inspector)?;
+                    this.inspected_block_executor(&block, &mut db, evm_env, inspector_setup())?;
                 executor.evm_mut().enable_inspector();
 
                 let mut results = Vec::with_capacity(max_transactions);
@@ -382,7 +369,6 @@ pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> + Call {
                     let output = executor
                         .execute_transaction_without_commit(tx)
                         .map_err(Self::Error::from_eth_err)?;
-                    let ResultAndState { result, state } = output.result();
 
                     let tx_info = TransactionInfo {
                         hash: Some(*tx.tx_hash()),
@@ -392,25 +378,14 @@ pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> + Call {
                         block_timestamp: Some(block_timestamp),
                         base_fee: Some(base_fee),
                     };
-                    let mut was_fused = false;
                     let (db, inspector, _) = executor.evm_mut().components_mut();
+                    let inspector = core::mem::replace(inspector, inspector_setup());
                     results.push(f(
                         tx_info,
-                        TracingCtx {
-                            tx,
-                            result,
-                            state,
-                            inspector,
-                            db,
-                            fused_inspector: &fused_inspector,
-                            was_fused: &mut was_fused,
-                        },
+                        TracingCtx { result: output.result(), db: &mut *db, inspector },
                     )?);
-                    // The inspector and state of the last traced transaction are not needed.
+                    // The state of the last traced transaction is not needed.
                     if transactions.peek().is_some() {
-                        if !was_fused {
-                            *executor.evm_mut().inspector_mut() = fused_inspector.clone();
-                        }
                         executor.commit_transaction(output);
                     }
                 }
@@ -446,7 +421,7 @@ pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> + Call {
                 TransactionInfo,
                 TracingCtx<
                     '_,
-                    Recovered<&ProviderTx<Self::Provider>>,
+                    TracingInspector,
                     EvmFor<Self::Evm, &mut StateCacheDb, TracingInspector>,
                 >,
             ) -> Result<R, Self::Error>
@@ -484,16 +459,12 @@ pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> + Call {
         // state and db
         F: Fn(
                 TransactionInfo,
-                TracingCtx<
-                    '_,
-                    Recovered<&ProviderTx<Self::Provider>>,
-                    EvmFor<Self::Evm, &mut StateCacheDb, Insp>,
-                >,
+                TracingCtx<'_, Insp, EvmFor<Self::Evm, &mut StateCacheDb, Insp>>,
             ) -> Result<R, Self::Error>
             + Send
             + 'static,
         Setup: FnMut() -> Insp + Send + 'static,
-        Insp: Clone + for<'a> InspectorFor<Self::Evm, &'a mut StateCacheDb>,
+        Insp: for<'a> InspectorFor<Self::Evm, &'a mut StateCacheDb>,
         R: Send + 'static,
     {
         self.trace_block_until_with_inspector(block_id, block, None, insp_setup, f)
@@ -519,29 +490,27 @@ pub trait Trace: LoadState<Error: FromEvmError<Self::Evm>> + Call {
     }
 }
 
-/// Context for one transaction of a block traced by [`Trace::trace_block_until_with_inspector`].
-#[derive(Debug)]
-pub struct TracingCtx<'a, T, E: Evm> {
-    /// The transaction that was just executed.
-    pub tx: T,
-    /// Result of transaction execution.
-    pub result: &'a ExecutionResult<E::HaltReason>,
-    /// State changes after transaction.
-    pub state: &'a EvmState,
-    /// Inspector state after transaction.
-    pub inspector: &'a mut E::Inspector,
-    /// Database used when executing the transaction, _before_ committing the state changes.
+/// Context passed to per-transaction trace callbacks.
+///
+/// Explicit callback annotations must import this type instead of alloy-evm's tracing context.
+pub struct TracingCtx<'a, Insp, E: Evm> {
+    /// Execution result and state changes for the transaction.
+    pub result: &'a ResultAndState<E::HaltReason>,
+    /// Database pointing to the transaction pre-state.
     pub db: &'a mut E::DB,
-    /// Inspector state before any transaction was executed.
-    fused_inspector: &'a E::Inspector,
-    /// Whether the inspector was already reset by [`TracingCtx::take_inspector`].
-    was_fused: &'a mut bool,
+    /// Inspector used while executing the transaction.
+    pub inspector: Insp,
 }
 
-impl<T, E: Evm<Inspector: Clone>> TracingCtx<'_, T, E> {
-    /// Returns the inspector state of this transaction, resetting the inspector for the next one.
-    pub fn take_inspector(&mut self) -> E::Inspector {
-        *self.was_fused = true;
-        core::mem::replace(self.inspector, self.fused_inspector.clone())
+impl<Insp, E: Evm> core::fmt::Debug for TracingCtx<'_, Insp, E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TracingCtx").finish_non_exhaustive()
+    }
+}
+
+impl<Insp, E: Evm> TracingCtx<'_, Insp, E> {
+    /// Consumes this context and returns the inspector.
+    pub fn take_inspector(self) -> Insp {
+        self.inspector
     }
 }

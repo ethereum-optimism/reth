@@ -7,7 +7,7 @@ use super::{LoadBlock, LoadPendingBlock, LoadState, LoadTransaction, SpawnBlocki
 use crate::{
     helpers::estimate::EstimateCall, FromEvmError, FullEthApiTypes, RpcBlock, RpcNodeCore,
 };
-use alloy_consensus::{transaction::TxHashRef, BlockHeader};
+use alloy_consensus::BlockHeader;
 use alloy_eips::eip2930::AccessListResult;
 use alloy_evm::overrides::{apply_block_overrides, apply_state_overrides, OverrideBlockHashes};
 use alloy_network::TransactionBuilder;
@@ -24,9 +24,11 @@ use reth_evm::{
     block::{BlockExecutor, TxResult},
     env::BlockEnvironment,
     execute::BlockBuilder,
-    ConfigureEvm, Evm, EvmEnvFor, HaltReasonFor, InspectorFor, TransactionEnvMut, TxEnvFor,
+    BlockExecutorForEvm, ConfigureEvm, Evm, EvmEnvFor, HaltReasonFor, InspectorFor,
+    TransactionEnvMut, TxEnvFor,
 };
 use reth_node_api::BlockBody;
+use reth_primitives_traits::{BlockTy, Recovered, RecoveredBlock};
 use reth_revm::{
     cancelled::CancelOnDrop,
     database::StateProviderDatabase,
@@ -42,7 +44,7 @@ use reth_rpc_eth_types::{
     simulate::{self, EthSimulateError},
     EthApiError, StateCacheDb,
 };
-use reth_storage_api::BlockIdReader;
+use reth_storage_api::{BlockIdReader, ProviderTx, StateProviderBox};
 use revm::{
     context::Block,
     context_interface::{result::ResultAndState, Cfg, Transaction},
@@ -751,22 +753,12 @@ pub trait Call:
                     return f(tx_info, res, db)
                 }
 
-                let block_txs = block.transactions_recovered();
-
-                let mut executor = RpcNodeCore::evm_config(&this)
-                    .executor_for_block(&mut db, block.sealed_block())
-                    .map_err(RethError::other)
-                    .map_err(Self::Error::from_eth_err)?;
-                executor.apply_pre_execution_changes().map_err(Self::Error::from_eth_err)?;
-
-                // replay all transactions prior to the targeted transaction
-                for block_tx in block_txs {
-                    if block_tx.tx_hash() == tx.tx_hash() {
-                        break;
-                    }
-                    executor.execute_transaction(block_tx).map_err(Self::Error::from_eth_err)?;
-                }
-
+                let mut executor = this.block_executor(&block, &mut db)?;
+                this.replay_transactions_until_with_executor(
+                    &mut executor,
+                    block.transactions_recovered(),
+                    tx_info.index.expect("included transaction has an index") as usize,
+                )?;
                 let res = executor
                     .execute_transaction_without_commit(tx)
                     .map_err(Self::Error::from_eth_err)?
@@ -777,6 +769,49 @@ pub trait Call:
             .await
             .map(Some)
         }
+    }
+
+    /// Creates a block executor for `block` on `db` and applies the block's pre-execution
+    /// changes.
+    ///
+    /// Replaying a block's own transactions through the executor rather than a bare EVM includes
+    /// the changes the executor applies on top of each EVM result, so replayed results agree with
+    /// the block's receipts and state.
+    fn block_executor<'a>(
+        &'a self,
+        block: &'a RecoveredBlock<BlockTy<Self::Primitives>>,
+        db: &'a mut StateCacheDb,
+    ) -> Result<
+        BlockExecutorForEvm<'a, Self::Evm, StateProviderDatabase<StateProviderBox>>,
+        Self::Error,
+    > {
+        let mut executor = self
+            .evm_config()
+            .executor_for_block(db, block.sealed_block())
+            .map_err(RethError::other)
+            .map_err(Self::Error::from_eth_err)?;
+        executor.apply_pre_execution_changes().map_err(Self::Error::from_eth_err)?;
+        Ok(executor)
+    }
+
+    /// Replays all transactions before the target transaction index through the given executor.
+    ///
+    /// If the target index is greater than or equal to the iterator length, all transactions are
+    /// replayed.
+    fn replay_transactions_until_with_executor<'a, E, Txs>(
+        &self,
+        executor: &mut E,
+        transactions: Txs,
+        target_tx_index: usize,
+    ) -> Result<(), Self::Error>
+    where
+        E: BlockExecutor<Transaction = ProviderTx<Self::Provider>>,
+        Txs: IntoIterator<Item = Recovered<&'a ProviderTx<Self::Provider>>>,
+    {
+        for tx in transactions.into_iter().take(target_tx_index) {
+            executor.execute_transaction(tx).map_err(Self::Error::from_eth_err)?;
+        }
+        Ok(())
     }
 
     ///
