@@ -39,7 +39,7 @@ jobs:
         run: |
           cd docs/vocs/
           bun i
-          npx playwright install --with-deps chromium
+          npx playwright@1.64.1 install --with-deps chromium
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
