@@ -34,7 +34,7 @@ use revm::DatabaseCommit;
 use revm_inspectors::{
     opcode::OpcodeGasInspector,
     storage::StorageInspector,
-    tracing::{parity::populate_state_diff, TracingInspector, TracingInspectorConfig},
+    tracing::{TracingInspector, TracingInspectorConfig},
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -443,7 +443,7 @@ where
                                 Some(block.clone()),
                                 None,
                                 TracingInspectorConfig::default_parity(),
-                                move |tx_info, mut ctx| {
+                                move |tx_info, ctx| {
                                     // Keep the block replay permit inside the spawned replay task.
                                     let _block_replay_permit = &permit;
                                     let mut traces = ctx
@@ -525,7 +525,7 @@ where
                 block_id,
                 Some(block.clone()),
                 TracingInspectorConfig::default_parity(),
-                |tx_info, mut ctx| {
+                |tx_info, ctx| {
                     let traces = ctx
                         .take_inspector()
                         .into_parity_builder()
@@ -561,18 +561,12 @@ where
                 block_id,
                 None,
                 TracingInspectorConfig::from_parity_config(&trace_types),
-                move |tx_info, mut ctx| {
-                    let mut full_trace = ctx
-                        .take_inspector()
+                move |tx_info, ctx| {
+                    let full_trace = ctx
+                        .inspector
                         .into_parity_builder()
-                        .into_trace_results(&ctx.result, &trace_types);
-
-                    // If statediffs were requested, populate them with the account balance and
-                    // nonce from pre-state
-                    if let Some(ref mut state_diff) = full_trace.state_diff {
-                        populate_state_diff(state_diff, &ctx.db, ctx.state.iter())
-                            .map_err(Eth::Error::from_eth_err)?;
-                    }
+                        .into_trace_results_with_state(ctx.result, &trace_types, &**ctx.db)
+                        .map_err(Eth::Error::from_eth_err)?;
 
                     let trace = TraceResultsWithTransactionHash {
                         transaction_hash: tx_info.hash.expect("tx hash is set"),
@@ -638,7 +632,7 @@ where
                 block_id,
                 Some(block.clone()),
                 StorageInspector::default,
-                move |tx_info, mut ctx| {
+                move |tx_info, ctx| {
                     let unique_loads = ctx.inspector.unique_loads();
                     let warm_loads = ctx.inspector.warm_loads();
                     let trace = TransactionStorageAccess {
