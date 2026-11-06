@@ -351,7 +351,7 @@ where
                 num.into(),
                 None,
                 TracingInspectorConfig::default_parity(),
-                move |tx_info, mut ctx| {
+                move |tx_info, ctx| {
                     let _permit = &permit;
                     Ok(ctx
                         .take_inspector()
