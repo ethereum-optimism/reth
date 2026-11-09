@@ -2263,15 +2263,23 @@ impl SparseTrie for ArenaParallelSparseTrie {
             let (_, subtrie, node_vec) = &mut taken[0];
             subtrie.reveal_nodes(node_vec)?;
         } else {
-            use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
+            #[cfg(feature = "std")]
+            let results: Vec<SparseTrieResult<()>> = {
+                use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
 
-            let parent_span = tracing::Span::current();
+                let parent_span = tracing::Span::current();
+                taken
+                    .par_iter_mut()
+                    .map(|(_, subtrie, node_vec)| {
+                        let _guard = parent_span.enter();
+                        subtrie.reveal_nodes(node_vec)
+                    })
+                    .collect()
+            };
+            #[cfg(not(feature = "std"))]
             let results: Vec<SparseTrieResult<()>> = taken
-                .par_iter_mut()
-                .map(|(_, subtrie, node_vec)| {
-                    let _guard = parent_span.enter();
-                    subtrie.reveal_nodes(node_vec)
-                })
+                .iter_mut()
+                .map(|(_, subtrie, node_vec)| subtrie.reveal_nodes(node_vec))
                 .collect();
 
             if let Some(err) = results.into_iter().find(|r| r.is_err()) {
@@ -2349,23 +2357,28 @@ impl SparseTrie for ArenaParallelSparseTrie {
 
         // Hash taken subtries in parallel if total dirty leaves meet the threshold.
         if !taken.is_empty() {
-            if taken.len() == 1 || total_dirty_leaves < self.parallelism_thresholds.min_dirty_leaves
+            if cfg!(not(feature = "std")) ||
+                taken.len() == 1 ||
+                total_dirty_leaves < self.parallelism_thresholds.min_dirty_leaves
             {
                 for (_, subtrie) in &mut taken {
                     subtrie.update_cached_rlp(new_epoch);
                 }
             } else {
-                use rayon::iter::{IntoParallelIterator, ParallelIterator};
+                #[cfg(feature = "std")]
+                {
+                    use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-                let parent_span = tracing::Span::current();
-                taken = taken
-                    .into_par_iter()
-                    .map(|(idx, mut subtrie)| {
-                        let _guard = parent_span.enter();
-                        subtrie.update_cached_rlp(new_epoch);
-                        (idx, subtrie)
-                    })
-                    .collect();
+                    let parent_span = tracing::Span::current();
+                    taken = taken
+                        .into_par_iter()
+                        .map(|(idx, mut subtrie)| {
+                            let _guard = parent_span.enter();
+                            subtrie.update_cached_rlp(new_epoch);
+                            (idx, subtrie)
+                        })
+                        .collect();
+                }
             }
         }
 
@@ -2563,27 +2576,31 @@ impl SparseTrie for ArenaParallelSparseTrie {
 
         if !taken.is_empty() {
             // Prune taken subtries, in parallel if more than one.
-            if taken.len() == 1 {
-                let (_, ref mut subtrie) = taken[0];
-                pruned += subtrie.prune(prune_before);
+            if cfg!(not(feature = "std")) || taken.len() == 1 {
+                for (_, subtrie) in &mut taken {
+                    pruned += subtrie.prune(prune_before);
+                }
             } else {
-                use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
+                #[cfg(feature = "std")]
+                {
+                    use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
 
-                let parent_span = tracing::Span::current();
-                pruned += taken
-                    .par_iter_mut()
-                    .map(|(_, subtrie)| {
-                        let _guard = parent_span.enter();
-                        let _span = tracing::trace_span!(
-                            target: TRACE_TARGET,
-                            "subtrie_prune",
-                            subtrie = ?subtrie.path,
-                        )
-                        .entered();
+                    let parent_span = tracing::Span::current();
+                    pruned += taken
+                        .par_iter_mut()
+                        .map(|(_, subtrie)| {
+                            let _guard = parent_span.enter();
+                            let _span = tracing::trace_span!(
+                                target: TRACE_TARGET,
+                                "subtrie_prune",
+                                subtrie = ?subtrie.path,
+                            )
+                            .entered();
 
-                        subtrie.prune(prune_before)
-                    })
-                    .sum::<usize>();
+                            subtrie.prune(prune_before)
+                        })
+                        .sum::<usize>();
+                }
             }
 
             // Restore taken subtries into the upper arena.
@@ -2818,17 +2835,21 @@ impl SparseTrie for ArenaParallelSparseTrie {
         }
 
         // Apply updates to taken subtries, in parallel if more than one.
-        if taken.len() == 1 {
-            let (_, ref mut subtrie, ref range) = taken[0];
-            subtrie.update_leaves(&sorted[range.clone()]);
-        } else {
-            use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
-
-            let parent_span = tracing::Span::current();
-            taken.par_iter_mut().for_each(|(_, subtrie, range)| {
-                let _guard = parent_span.enter();
+        if cfg!(not(feature = "std")) || taken.len() == 1 {
+            for (_, subtrie, range) in &mut taken {
                 subtrie.update_leaves(&sorted[range.clone()]);
-            });
+            }
+        } else {
+            #[cfg(feature = "std")]
+            {
+                use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
+
+                let parent_span = tracing::Span::current();
+                taken.par_iter_mut().for_each(|(_, subtrie, range)| {
+                    let _guard = parent_span.enter();
+                    subtrie.update_leaves(&sorted[range.clone()]);
+                });
+            }
         }
 
         // Collect subtrie paths before consuming `taken`, then restore subtries and
