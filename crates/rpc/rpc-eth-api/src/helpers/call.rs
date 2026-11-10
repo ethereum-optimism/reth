@@ -59,6 +59,9 @@ use tracing::{debug, trace};
 /// Result type for `eth_simulateV1` RPC method.
 pub type SimulatedBlocksResult<N, E> = Result<Vec<SimulatedBlock<RpcBlock<N>>>, E>;
 
+/// The database a [`StateCacheDb`] reads through, which [`Call::block_executor`] executes on.
+type StateCacheProviderDb = StateProviderDatabase<EvmStateProviderAdapter<StateProviderBox>>;
+
 /// Execution related functions for the [`EthApiServer`](crate::EthApiServer) trait in
 /// the `eth_` namespace.
 pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthApiTypes {
@@ -780,14 +783,7 @@ pub trait Call:
         &'a self,
         block: &'a RecoveredBlock<BlockTy<Self::Primitives>>,
         db: &'a mut StateCacheDb,
-    ) -> Result<
-        BlockExecutorForEvm<
-            'a,
-            Self::Evm,
-            StateProviderDatabase<EvmStateProviderAdapter<StateProviderBox>>,
-        >,
-        Self::Error,
-    > {
+    ) -> Result<BlockExecutorForEvm<'a, Self::Evm, StateCacheProviderDb>, Self::Error> {
         let mut executor = self
             .evm_config()
             .executor_for_block(db, block.sealed_block())
