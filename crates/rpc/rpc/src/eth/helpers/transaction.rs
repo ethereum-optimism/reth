@@ -577,4 +577,250 @@ mod tests {
             "max_fee_per_blob_gas should not be set for non-blob tx"
         );
     }
+    mod lookup_hooks {
+        use super::*;
+        use reth_primitives_traits::RecoveredBlock;
+        use reth_rpc_eth_api::{helpers::SpawnBlocking, EthApiTypes, RpcNodeCoreExt};
+        use reth_rpc_eth_types::{EthApiSettings, EthStateCache, TransactionSource};
+        use reth_tasks::{
+            pool::{BlockingTaskGuard, BlockingTaskPool},
+            Runtime,
+        };
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::sync::Semaphore;
+
+        type TestApi = EthApi<
+            RpcNodeCoreAdapter<MockEthProvider, TestPool, NoopNetwork, EthEvmConfig>,
+            EthRpcConverter<ChainSpec>,
+        >;
+
+        #[derive(Clone)]
+        struct PendingApi {
+            inner: TestApi,
+            hash: B256,
+            pending: Option<TransactionSource>,
+            fail: bool,
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl RpcNodeCore for PendingApi {
+            type Primitives = <TestApi as RpcNodeCore>::Primitives;
+            type Provider = <TestApi as RpcNodeCore>::Provider;
+            type Pool = <TestApi as RpcNodeCore>::Pool;
+            type Evm = <TestApi as RpcNodeCore>::Evm;
+            type Network = <TestApi as RpcNodeCore>::Network;
+            fn pool(&self) -> &Self::Pool {
+                self.inner.pool()
+            }
+            fn provider(&self) -> &Self::Provider {
+                self.inner.provider()
+            }
+            fn evm_config(&self) -> &Self::Evm {
+                self.inner.evm_config()
+            }
+            fn network(&self) -> &Self::Network {
+                self.inner.network()
+            }
+        }
+
+        impl RpcNodeCoreExt for PendingApi {
+            fn cache(&self) -> &EthStateCache<Self::Primitives> {
+                self.inner.cache()
+            }
+        }
+
+        impl EthApiTypes for PendingApi {
+            type Error = EthApiError;
+            type NetworkTypes = <TestApi as EthApiTypes>::NetworkTypes;
+            type RpcConvert = <TestApi as EthApiTypes>::RpcConvert;
+            fn eth_api_settings(&self) -> &EthApiSettings {
+                self.inner.eth_api_settings()
+            }
+            fn converter(&self) -> &Self::RpcConvert {
+                self.inner.converter()
+            }
+        }
+
+        impl SpawnBlocking for PendingApi {
+            fn io_task_spawner(&self) -> &Runtime {
+                self.inner.io_task_spawner()
+            }
+            fn tracing_task_pool(&self) -> &BlockingTaskPool {
+                self.inner.tracing_task_pool()
+            }
+            fn tracing_task_guard(&self) -> &BlockingTaskGuard {
+                self.inner.tracing_task_guard()
+            }
+            fn blocking_io_task_guard(&self) -> &Arc<Semaphore> {
+                self.inner.blocking_io_task_guard()
+            }
+        }
+
+        impl LoadTransaction for PendingApi {
+            async fn transaction_by_hash_from_pending(
+                &self,
+                _hash: B256,
+            ) -> Result<Option<TransactionSource>, Self::Error> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.fail {
+                    return Err(EthApiError::InvalidParams("pending lookup failed".into()));
+                }
+                Ok(self.pending.clone())
+            }
+        }
+
+        async fn pending_api() -> PendingApi {
+            let inner = mock_eth_api(Default::default());
+            let hash = inner.send_raw_transaction(raw_transfer_tx()).await.unwrap();
+            let transaction = inner.pool().get(&hash).unwrap().transaction.clone_into_consensus();
+            let pending = TransactionSource::Block {
+                transaction,
+                index: 0,
+                block_hash: B256::repeat_byte(42),
+                block_number: 42,
+                block_timestamp: 42,
+                base_fee: Some(1),
+            };
+            PendingApi {
+                inner,
+                hash,
+                pending: Some(pending),
+                fail: false,
+                calls: Default::default(),
+            }
+        }
+
+        #[tokio::test]
+        async fn pending_hook_precedes_pool_and_misses_fall_through() {
+            let mut api = pending_api().await;
+            let hash = api.hash;
+            assert_eq!(api.transaction_by_hash(hash).await.unwrap(), api.pending);
+            assert_eq!(api.calls.load(Ordering::SeqCst), 1);
+            api.pending = None;
+            assert!(matches!(
+                api.transaction_by_hash(hash).await.unwrap(),
+                Some(TransactionSource::Pool(_))
+            ));
+            assert!(api.transaction_by_hash(B256::ZERO).await.unwrap().is_none());
+            assert_eq!(api.calls.load(Ordering::SeqCst), 3);
+            // The unmodified Ethereum API uses the default no-op hook.
+            assert!(matches!(
+                LoadTransaction::transaction_by_hash(&api.inner, hash).await.unwrap(),
+                Some(TransactionSource::Pool(_))
+            ));
+            assert!(LoadTransaction::transaction_by_hash(&api.inner, B256::ZERO)
+                .await
+                .unwrap()
+                .is_none());
+        }
+
+        #[tokio::test]
+        async fn pending_hook_errors_stop_pool_fallback() {
+            let mut api = pending_api().await;
+            let hash = api.hash;
+            api.fail = true;
+            assert!(matches!(
+                api.transaction_by_hash(hash).await,
+                Err(EthApiError::InvalidParams(_))
+            ));
+            assert_eq!(api.calls.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn historical_lookup_precedes_pending_hook() {
+            let mut api = pending_api().await;
+            let hash = api.hash;
+            let transaction = api.pending.clone().unwrap().into_recovered().into_inner();
+            let block_hash = B256::repeat_byte(11);
+            let block = Block::new(
+                Header {
+                    number: 11,
+                    timestamp: 12,
+                    base_fee_per_gas: Some(7),
+                    ..Default::default()
+                },
+                alloy_consensus::BlockBody {
+                    transactions: vec![transaction],
+                    ..Default::default()
+                },
+            );
+            api.provider().add_block(block_hash, block);
+            api.fail = true;
+            assert!(
+                matches!(api.transaction_by_hash(hash).await.unwrap(), Some(TransactionSource::Block {
+                block_hash: actual, block_number: 11, block_timestamp: 12, base_fee: Some(7), index: 0, ..
+            }) if actual == block_hash)
+            );
+            assert_eq!(api.calls.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn canonical_cache_precedes_pending_and_tracks_reorgs() {
+            use reth_chain_state::CanonStateNotification;
+            use reth_provider::{Chain, ExecutionOutcome};
+            use reth_rpc_eth_types::cache::cache_new_blocks_task;
+
+            let api = pending_api().await;
+            let hash = api.hash;
+            let recovered = api.pending.clone().unwrap().into_recovered();
+            let chain = |number, transactions: bool| {
+                let block = Block::new(
+                    Header { number, timestamp: number, ..Default::default() },
+                    alloy_consensus::BlockBody {
+                        transactions: if transactions {
+                            vec![recovered.clone().into_inner()]
+                        } else {
+                            vec![]
+                        },
+                        ..Default::default()
+                    },
+                );
+                Arc::new(Chain::new(
+                    [RecoveredBlock::new_unhashed(
+                        block,
+                        if transactions { vec![recovered.signer()] } else { vec![] },
+                    )],
+                    ExecutionOutcome::new(Default::default(), vec![vec![]], number, vec![]),
+                    Default::default(),
+                ))
+            };
+            let original = chain(1, true);
+            cache_new_blocks_task(
+                api.cache().clone(),
+                futures::stream::iter([CanonStateNotification::Commit { new: original.clone() }]),
+            )
+            .await;
+            assert!(matches!(
+                api.transaction_by_hash(hash).await.unwrap(),
+                Some(TransactionSource::Block { block_number: 1, .. })
+            ));
+            let replacement = chain(2, true);
+            cache_new_blocks_task(
+                api.cache().clone(),
+                futures::stream::iter([CanonStateNotification::Reorg {
+                    old: original,
+                    new: replacement.clone(),
+                }]),
+            )
+            .await;
+            assert!(matches!(
+                api.transaction_by_hash(hash).await.unwrap(),
+                Some(TransactionSource::Block { block_number: 2, .. })
+            ));
+            assert_eq!(api.calls.load(Ordering::SeqCst), 0);
+            cache_new_blocks_task(
+                api.cache().clone(),
+                futures::stream::iter([CanonStateNotification::Reorg {
+                    old: replacement,
+                    new: chain(3, false),
+                }]),
+            )
+            .await;
+            assert_eq!(api.transaction_by_hash(hash).await.unwrap(), api.pending);
+            assert_eq!(api.calls.load(Ordering::SeqCst), 1);
+        }
+    }
 }
