@@ -1539,6 +1539,19 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     return false;
                 }
 
+                // With `sender_recovery` set to `Full`, blocks are persisted without senders, but
+                // the `Full` prune checkpoint above is only written once the pruner or the sender
+                // recovery stage runs. A node that has only ever persisted blocks through the
+                // engine, and whose pruner is still held back by the minimum pruning distance, has
+                // no checkpoint yet; checking it would request an unwind to genesis. Skip the
+                // check only while the segment holds no senders, so stale rows are still healed.
+                if provider.prune_modes_ref().sender_recovery.is_some_and(|mode| mode.is_full()) &&
+                    self.get_highest_static_file_tx(segment).is_none()
+                {
+                    debug!(target: "reth::providers::static_file", ?segment, "Skipping senders segment: configured as fully pruned and empty");
+                    return false;
+                }
+
                 true
             }
             StaticFileSegment::AccountChangeSets => {
