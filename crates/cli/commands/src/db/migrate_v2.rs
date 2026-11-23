@@ -472,18 +472,30 @@ mod tests {
     /// start from carried-over state.
     const UNALIGNED_GENESIS: u64 = 500_010;
 
+    /// A non-zero genesis at the start of a static file range.
+    const ALIGNED_GENESIS: u64 = 500_000;
+
     #[test]
     fn migrates_changesets_of_unaligned_genesis_chain() {
-        let factory = create_test_provider_factory_with_genesis_block_number(UNALIGNED_GENESIS);
+        migrates_changesets_from(UNALIGNED_GENESIS);
+    }
+
+    #[test]
+    fn migrates_changesets_of_aligned_genesis_chain() {
+        migrates_changesets_from(ALIGNED_GENESIS);
+    }
+
+    fn migrates_changesets_from(genesis: u64) {
+        let factory = create_test_provider_factory_with_genesis_block_number(genesis);
         factory.set_storage_settings_cache(StorageSettings::v1());
-        let tip = UNALIGNED_GENESIS + 3;
+        let tip = genesis + 3;
         let address = Address::with_last_byte(7);
         let key = B256::with_last_byte(3);
 
         // v1 history in MDBX: one account and one storage change per block, from genesis on.
         {
             let provider_rw = factory.provider_rw().unwrap();
-            for block in UNALIGNED_GENESIS..=tip {
+            for block in genesis..=tip {
                 provider_rw
                     .tx_ref()
                     .put::<tables::AccountChangeSets>(
@@ -514,7 +526,7 @@ mod tests {
         // Changesets are read from static files only with v2 settings.
         factory.set_storage_settings_cache(StorageSettings::v2());
         let provider = factory.provider().unwrap();
-        for block in UNALIGNED_GENESIS..=tip {
+        for block in genesis..=tip {
             assert_eq!(
                 provider.account_block_changeset(block).unwrap(),
                 vec![AccountBeforeTx { address, info: None }],

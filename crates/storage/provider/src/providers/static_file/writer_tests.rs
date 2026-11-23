@@ -907,4 +907,27 @@ mod tests {
             Some(250)
         );
     }
+
+    /// `ensure_at_block` on a fresh file is a no-op when asked for the block before the file's
+    /// first: the writer already appends that first block next. It used to open the first block
+    /// and then fail, which broke callers that position a writer before the first block they
+    /// write, such as `db migrate-v2` on a chain whose genesis is the first block of a file.
+    #[test]
+    fn test_ensure_at_block_before_empty_non_genesis_file() {
+        let static_dir = tempfile::tempdir().unwrap();
+        let provider = setup_test_provider(&static_dir, 100);
+
+        // A writer for block 250 opens a fresh empty file covering blocks 200..=299.
+        let mut writer = provider.get_writer(250, StaticFileSegment::TransactionSenders).unwrap();
+        writer.ensure_at_block(199).unwrap();
+        assert_eq!(writer.current_block_number(), None);
+        assert_eq!(writer.next_block_number(), 200);
+
+        writer.increment_block(200).unwrap();
+        writer.commit().unwrap();
+        assert_eq!(
+            provider.get_highest_static_file_block(StaticFileSegment::TransactionSenders),
+            Some(200)
+        );
+    }
 }

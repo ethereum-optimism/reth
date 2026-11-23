@@ -771,6 +771,10 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             // pruned segment may be positioned on a later fixed range, in which case its
             // first block is the expected start of that range.
             let first_block = self.writer.user_header().expected_block_start();
+            if first_block.checked_sub(1) == Some(advance_to) {
+                // Already positioned: the next block written is the file's first.
+                return Ok(())
+            }
             self.increment_block(first_block)?;
             first_block
         };
