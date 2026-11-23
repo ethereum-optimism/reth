@@ -265,23 +265,16 @@ where
     // Behaviour reserved only for new nodes should be set in the storage settings.
     provider_rw.write_storage_settings(genesis_storage_settings)?;
 
-    // For non-zero genesis blocks, set expected_block_start BEFORE insert_genesis_state.
-    // When block_range is None, next_block_number() uses expected_block_start. By default,
-    // expected_block_start comes from find_fixed_range which returns the file range start (0),
-    // not the genesis block number. This would cause increment_block(N) to fail.
+    // A changeset static file holds one changeset per block from the start of its range, and
+    // `insert_genesis_state` writes the genesis changeset. Fill the blocks of the file before a
+    // non-zero genesis with empty changesets first, as a state import at a later block does.
     let static_file_provider = provider_rw.static_file_provider();
-    if genesis_block_number > 0 {
-        if genesis_storage_settings.storage_v2 {
+    if genesis_block_number > 0 && genesis_storage_settings.storage_v2 {
+        for segment in [StaticFileSegment::AccountChangeSets, StaticFileSegment::StorageChangeSets]
+        {
             static_file_provider
-                .get_writer(genesis_block_number, StaticFileSegment::AccountChangeSets)?
-                .user_header_mut()
-                .set_expected_block_start(genesis_block_number);
-        }
-        if genesis_storage_settings.storage_v2 {
-            static_file_provider
-                .get_writer(genesis_block_number, StaticFileSegment::StorageChangeSets)?
-                .user_header_mut()
-                .set_expected_block_start(genesis_block_number);
+                .get_writer(genesis_block_number, segment)?
+                .ensure_at_block(genesis_block_number - 1)?;
         }
     }
 
@@ -932,8 +925,8 @@ fn snapshot_state_tables_empty<TX: reth_db_api::transaction::DbTx>(
 /// are empty. The import then starts a new file at `block`'s range boundary, padded with empty
 /// changesets up to `block`.
 ///
-/// A segment that ends exactly at `block` is the empty changeset `init_genesis` writes when the
-/// import is at a non-zero genesis.
+/// A segment that ends exactly at `block` holds only the empty changesets `init_genesis` writes
+/// when the import is at a non-zero genesis.
 fn reset_pre_snapshot_changeset_segment<N: NodePrimitives>(
     static_file_provider: &reth_provider::providers::StaticFileProvider<N>,
     segment: StaticFileSegment,
@@ -1317,6 +1310,7 @@ mod tests {
         test_utils::{create_test_provider_factory_with_chain_spec, MockNodeTypesWithDB},
         ProviderFactory, RocksDBProviderFactory,
     };
+    use reth_static_file_types::SegmentRangeInclusive;
     use std::{collections::BTreeMap, sync::Arc};
 
     fn collect_table_entries<DB, T>(
@@ -1520,19 +1514,29 @@ mod tests {
     /// start from carried-over state.
     const UNALIGNED_GENESIS: u64 = 500_010;
 
-    /// Initializes a v2 genesis at [`UNALIGNED_GENESIS`] with an empty alloc, as for a chain whose
-    /// state is imported with `init-state`.
-    fn init_unaligned_v2_genesis() -> ProviderFactory<MockNodeTypesWithDB> {
-        let genesis = Genesis {
-            number: Some(UNALIGNED_GENESIS),
-            alloc: Default::default(),
-            ..MAINNET.genesis.clone()
-        };
+    /// A non-zero genesis at the start of a static file range.
+    const ALIGNED_GENESIS: u64 = 500_000;
+
+    /// The static file range that holds both [`UNALIGNED_GENESIS`] and [`ALIGNED_GENESIS`].
+    const GENESIS_FILE_RANGE: SegmentRangeInclusive = SegmentRangeInclusive::new(500_000, 999_999);
+
+    /// Initializes a v2 genesis at block `number` with the given alloc.
+    fn init_v2_genesis(
+        number: u64,
+        alloc: BTreeMap<Address, GenesisAccount>,
+    ) -> ProviderFactory<MockNodeTypesWithDB> {
+        let genesis = Genesis { number: Some(number), alloc, ..MAINNET.genesis.clone() };
         let factory = create_test_provider_factory_with_chain_spec(Arc::new(
             reth_chainspec::ChainSpecBuilder::mainnet().genesis(genesis).build(),
         ));
         init_genesis_with_settings_and_validate(&factory, StorageSettings::v2(), false).unwrap();
         factory
+    }
+
+    /// Initializes a v2 genesis at [`UNALIGNED_GENESIS`] with an empty alloc, as for a chain whose
+    /// state is imported with `init-state`.
+    fn init_unaligned_v2_genesis() -> ProviderFactory<MockNodeTypesWithDB> {
+        init_v2_genesis(UNALIGNED_GENESIS, Default::default())
     }
 
     /// Reopens the factory's static files as a later process does: a fresh provider on the same
@@ -1542,22 +1546,72 @@ mod tests {
     ) -> reth_provider::providers::StaticFileProvider<
         <ProviderFactory<MockNodeTypesWithDB> as reth_provider::NodePrimitivesProvider>::Primitives,
     > {
-        reth_provider::providers::StaticFileProviderBuilder::read_write(
-            factory.static_file_provider().directory(),
-        )
-        .with_genesis_block_number(UNALIGNED_GENESIS)
-        .build()
-        .unwrap()
+        let static_files = factory.static_file_provider();
+        reth_provider::providers::StaticFileProviderBuilder::read_write(static_files.directory())
+            .with_genesis_block_number(static_files.genesis_block_number())
+            .build()
+            .unwrap()
     }
 
+    /// The changeset files of a non-zero genesis keep the range they are named after, and hold
+    /// empty changesets for the blocks of that range before the genesis block. A later process
+    /// finds them by name, reads the genesis changeset at the genesis block and continues after
+    /// it.
     #[test]
-    fn init_genesis_v2_unaligned_changeset_writers_resume_after_reopen() {
-        let factory = init_unaligned_v2_genesis();
-        let static_files = reopen_static_files(&factory);
-        for segment in [StaticFileSegment::AccountChangeSets, StaticFileSegment::StorageChangeSets]
-        {
-            let writer = static_files.latest_writer(segment).unwrap();
-            assert_eq!(writer.next_block_number(), UNALIGNED_GENESIS + 1, "{segment}");
+    fn init_genesis_v2_pads_changesets_up_to_non_zero_genesis() {
+        let address = Address::with_last_byte(2);
+        let storage_key = B256::with_last_byte(3);
+        let account = GenesisAccount {
+            balance: U256::from(5),
+            storage: Some(BTreeMap::from([(storage_key, B256::with_last_byte(4))])),
+            ..Default::default()
+        };
+
+        for genesis in [UNALIGNED_GENESIS, ALIGNED_GENESIS] {
+            let factory = init_v2_genesis(genesis, BTreeMap::from([(address, account.clone())]));
+            let static_files = reopen_static_files(&factory);
+
+            for segment in
+                [StaticFileSegment::AccountChangeSets, StaticFileSegment::StorageChangeSets]
+            {
+                let writer = static_files.latest_writer(segment).unwrap();
+                let header = writer.user_header();
+                assert_eq!(header.expected_block_range(), GENESIS_FILE_RANGE, "{segment}");
+                assert_eq!(
+                    header.block_range(),
+                    Some(SegmentRangeInclusive::new(GENESIS_FILE_RANGE.start(), genesis)),
+                    "{segment}"
+                );
+                assert_eq!(writer.next_block_number(), genesis + 1, "{segment}");
+            }
+
+            assert_eq!(
+                reth_provider::ChangeSetReader::account_block_changeset(&static_files, genesis)
+                    .unwrap(),
+                vec![AccountBeforeTx { address, info: None }]
+            );
+            assert_eq!(
+                reth_provider::StorageChangeSetReader::storage_changeset(&static_files, genesis)
+                    .unwrap(),
+                vec![(
+                    BlockNumberAddress((genesis, address)),
+                    StorageEntry { key: storage_key, value: U256::ZERO }
+                )]
+            );
+            for block in GENESIS_FILE_RANGE.start()..genesis {
+                assert!(
+                    reth_provider::ChangeSetReader::account_block_changeset(&static_files, block)
+                        .unwrap()
+                        .is_empty(),
+                    "block {block}"
+                );
+                assert!(
+                    reth_provider::StorageChangeSetReader::storage_changeset(&static_files, block)
+                        .unwrap()
+                        .is_empty(),
+                    "block {block}"
+                );
+            }
         }
     }
 
@@ -1594,8 +1648,8 @@ mod tests {
         }
     }
 
-    /// Rolls changesets back to the genesis block after a reopen, as a reorg does, through the
-    /// first file, whose start is the genesis block rather than its range start.
+    /// Rolls changesets back to the genesis block after a reopen, as a reorg does, in the first
+    /// file, which holds empty changesets before the genesis block.
     #[test]
     fn init_genesis_v2_unaligned_changesets_unwind_to_genesis_after_reopen() {
         let factory = init_unaligned_v2_genesis();
