@@ -520,7 +520,7 @@ thiserror = { version = "2.0.0", default-features = false }
 tar = "0.4.46"
 tracing = { version = "0.1.0", default-features = false, features = ["attributes"] }
 tracing-appender = "0.2.5"
-url = { version = "2.3", default-features = false }
+url = { version = "2.5.9", default-features = false }
 zstd = "0.13"
 byteorder = "1"
 fixed-cache = { version = "0.1.10", default-features = false, features = ["alloc"] }
