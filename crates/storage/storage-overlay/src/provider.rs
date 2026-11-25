@@ -1639,4 +1639,194 @@ mod tests {
             assert_eq!(storage_root, reth_trie::test_utils::storage_root_prehashed(expected));
         }
     }
+
+    /// Plain storage key whose hash starts with `prefix`, skipping the first `skip` matches.
+    fn plain_slot_with_prefix(prefix: &[u8], skip: usize) -> B256 {
+        let prefix = Nibbles::from_nibbles(prefix);
+        (0u64..)
+            .map(|i| B256::from(U256::from(i)))
+            .filter(|slot| Nibbles::unpack(alloy_primitives::keccak256(slot)).starts_with(&prefix))
+            .nth(skip)
+            .unwrap()
+    }
+
+    /// Applies each block's storage changes to `reference` and returns the blocks with the
+    /// resulting hashed state and, like the engine's, only the modified storage trie nodes.
+    fn executed_storage_blocks(
+        reference: &ProviderFactory<MockNodeTypesWithDB>,
+        hashed_address: B256,
+        blocks: impl IntoIterator<Item = ExecutedBlock<EthPrimitives>>,
+        changes: &[Vec<(B256, U256)>],
+    ) -> Vec<ExecutedBlock<EthPrimitives>> {
+        let mut storage_nodes = std::collections::BTreeMap::new();
+        blocks
+            .into_iter()
+            .zip(changes)
+            .map(|(block, changes)| {
+                let mut hashed_state = HashedPostState::default().with_storages([(
+                    hashed_address,
+                    HashedStorage::from_iter(changes.iter().copied()),
+                )]);
+                if block.recovered_block().number == 1 {
+                    hashed_state =
+                        hashed_state.with_accounts([(hashed_address, Some(Account::default()))]);
+                }
+                let provider = reference.provider().unwrap();
+                let (_, trie_updates) = reth_provider::LatestStateProviderRef::new(&provider)
+                    .state_root_with_updates(hashed_state.clone())
+                    .unwrap();
+                drop(provider);
+                let hashed_state = hashed_state.into_sorted();
+                let trie_updates = trie_updates.into_sorted();
+                let provider_rw = reference.provider_rw().unwrap();
+                reth_storage_api::StateWriter::write_hashed_state(&*provider_rw, &hashed_state)
+                    .unwrap();
+                reth_storage_api::TrieWriter::write_trie_updates_sorted(
+                    &*provider_rw,
+                    &trie_updates,
+                )
+                .unwrap();
+                provider_rw.commit().unwrap();
+
+                let modified_storage_nodes = trie_updates
+                    .storage_tries_ref()
+                    .get(&hashed_address)
+                    .map(|storage_trie| storage_trie.storage_nodes_ref())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|(path, node)| match node {
+                        Some(node) => {
+                            storage_nodes.insert(*path, node.clone()).as_ref() != Some(node)
+                        }
+                        None => storage_nodes.remove(path).is_some(),
+                    })
+                    .cloned()
+                    .collect();
+                let trie_updates = TrieUpdatesSorted::new(
+                    trie_updates.account_nodes_ref().to_vec(),
+                    alloy_primitives::map::B256Map::from_iter([(
+                        hashed_address,
+                        reth_trie::updates::StorageTrieUpdatesSorted {
+                            storage_nodes: modified_storage_nodes,
+                        },
+                    )]),
+                );
+                ExecutedBlock::new(
+                    Arc::clone(&block.recovered_block),
+                    Arc::clone(&block.execution_output),
+                    SortedTrieData::new(Arc::new(hashed_state), Arc::new(trie_updates)),
+                )
+            })
+            .collect()
+    }
+
+    /// After a reorg below the persisted tip, an overlay without trie changesets keeps the tip's
+    /// trie nodes and relies on prefix sets for every changed key. The fork blocks' trie updates
+    /// are relative to the anchor, so layering them on top would leave tip-only nodes (here
+    /// `0x120`) beneath anchor-relative branches.
+    #[test]
+    fn reverts_required_overlay_drops_anchor_relative_storage_nodes() {
+        let settings = reth_provider::StorageSettings::v1();
+        let address = Address::with_last_byte(0x16);
+        let hashed_address = alloy_primitives::keccak256(address);
+
+        let base = (0..=u8::MAX)
+            .filter(|first| *first != 0x12)
+            .flat_map(|first| {
+                [0x00, 0x80].map(|second| (hashed_slot(first, second), U256::from(1)))
+            })
+            .collect::<Vec<_>>();
+        // Plain keys, so the persisted blocks after the anchor can be reverted from changesets.
+        let tip_slots = [
+            plain_slot_with_prefix(&[1, 2, 0, 5], 0),
+            plain_slot_with_prefix(&[1, 2, 0, 5], 1),
+            plain_slot_with_prefix(&[1, 2, 0, 0xa], 0),
+        ];
+        let canonical_changes = vec![
+            vec![],
+            base.clone(),
+            vec![(alloy_primitives::keccak256(tip_slots[0]), U256::from(2))],
+            tip_slots[1..]
+                .iter()
+                .map(|slot| (alloy_primitives::keccak256(slot), U256::from(3)))
+                .collect(),
+        ];
+        let fork_changes = vec![
+            base,
+            vec![(hashed_slot(0x12, 0x80), U256::from(7))],
+            vec![
+                (hashed_slot(0x15, 0x00), U256::from(9)),
+                (hashed_slot(0x40, 0x00), U256::from(4)),
+            ],
+        ];
+
+        let canonical = executed_storage_blocks(
+            &create_test_provider_factory(),
+            hashed_address,
+            TestBlockBuilder::eth().get_executed_blocks(0..4),
+            &canonical_changes,
+        );
+        let mut fork_builder = TestBlockBuilder::eth();
+        let fork_two =
+            fork_builder.get_executed_block_with_number(2, canonical[1].recovered_block().hash());
+        let fork_three =
+            fork_builder.get_executed_block_with_number(3, fork_two.recovered_block().hash());
+        let fork = executed_storage_blocks(
+            &create_test_provider_factory(),
+            hashed_address,
+            [canonical[1].clone(), fork_two, fork_three],
+            &fork_changes,
+        );
+        assert!(canonical[2..].iter().any(|block| {
+            block.trie_updates().storage_tries_ref()[&hashed_address]
+                .storage_nodes_ref()
+                .iter()
+                .any(|(path, node)| *path == Nibbles::from_nibbles([1, 2, 0]) && node.is_some())
+        }));
+        assert!(fork[1..].iter().any(|block| {
+            !block.trie_updates().storage_tries_ref()[&hashed_address]
+                .storage_nodes_ref()
+                .is_empty()
+        }));
+
+        let factory = create_test_provider_factory();
+        factory.set_storage_settings_cache(settings);
+        let provider_rw = factory.provider_rw().unwrap();
+        for block in &canonical {
+            provider_rw.insert_block(block.recovered_block()).unwrap();
+        }
+        write_state_trie(&*provider_rw, &canonical[1..], &[]);
+        for (number, slot) in [(2, tip_slots[0]), (3, tip_slots[1]), (3, tip_slots[2])] {
+            provider_rw
+                .tx_ref()
+                .put::<tables::StorageChangeSets>(
+                    BlockNumberAddress((number, address)),
+                    reth_primitives_traits::StorageEntry { key: slot, value: U256::ZERO },
+                )
+                .unwrap();
+        }
+        // Without state masking, as op-reth runs: the state trie tip is the Finish tip.
+        provider_rw.save_stage_checkpoint(StageId::Finish, StageCheckpoint::new(3)).unwrap();
+        provider_rw.commit().unwrap();
+
+        let manager = OverlayManager::default();
+        for block in &fork[1..] {
+            manager.insert_block(block.clone());
+        }
+        let state_provider_factory = OverlayStateProviderFactory::new(
+            factory,
+            manager.overlay_builder(fork[2].recovered_block().hash()),
+        );
+        let provider = state_provider_factory.database_provider_ro().unwrap();
+        let overlay = provider.state_trie_overlay(false).unwrap().input();
+
+        let storage_node_paths: Vec<Nibbles> = overlay
+            .nodes
+            .storage_tries_ref()
+            .get(&hashed_address)
+            .map(|trie| trie.storage_nodes_ref().iter().map(|(path, _)| *path).collect())
+            .unwrap_or_default();
+        assert_eq!(storage_node_paths, []);
+        assert!(overlay.prefix_sets.storage_prefix_sets.contains_key(&hashed_address));
+    }
 }
