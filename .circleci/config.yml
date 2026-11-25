@@ -178,10 +178,15 @@ jobs:
             fi
 
             act_env=(--env "RUSTC_WRAPPER=" --env "GITHUB_BASE_REF=${base_ref}")
+            act_opts=()
             if [ "<< parameters.wf >>" = "unit.yml" ] && [ "$target_job" = "state" ]; then
               # EF tests use Rayon internally, so unrestricted nextest processes multiply
               # runnable threads and starve valid_blocks past its upstream timeout.
               act_env+=(--env "NEXTEST_TEST_THREADS=2")
+              # The job sets TMPDIR to /dev/shm for the whole build and test run (upstream
+              # paradigmxyz/reth#27851). Docker's 64 MB default /dev/shm cannot hold the compiler's
+              # temporary files, so give it a GitHub-runner-sized tmpfs.
+              act_opts+=(--container-options "--shm-size=8g")
             fi
             if [ "$event_name" != "pull_request" ]; then
               act_env+=(
@@ -196,6 +201,7 @@ jobs:
               -P "ubuntu-latest=catthehacker/ubuntu@sha256:b839c14c4410998529ec18f951262bdf87a2b23bc1467304d07b491b9455e074" \
               --concurrent-jobs << parameters.concurrent_jobs >> \
               "${act_env[@]}" \
+              "${act_opts[@]}" \
               -s GITHUB_TOKEN="${MISE_GITHUB_TOKEN:?missing restricted read-only GitHub token}" \
               --local-repository "mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba=/tmp/noop-action" \
               --local-repository "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6=/tmp/noop-action" \
